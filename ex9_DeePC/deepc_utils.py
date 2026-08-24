@@ -1,0 +1,631 @@
+import numpy as np
+import osqp
+from scipy import sparse
+
+from utils.env import Env, Dynamics
+from utils.controller import check_input_constraints
+
+
+'''------Implementation of DeePC------'''
+
+
+def _as_time_major(data: np.ndarray) -> np.ndarray:
+    data = np.asarray(data, dtype=float)
+    if data.ndim == 1:
+        data = data[:, None]
+    if data.ndim != 2:
+        raise ValueError("Data must be a 1D or 2D time-major array.")
+    return data
+
+
+def _block_hankel(data: np.ndarray, depth: int) -> np.ndarray:
+    """Build a block Hankel matrix from time-major data with shape (T, dim)."""
+    data = _as_time_major(data)
+    if depth < 1:
+        raise ValueError("Hankel depth must be at least 1.")
+
+    T, dim = data.shape
+    n_cols = T - depth + 1
+    if n_cols <= 0:
+        raise ValueError(f"Not enough samples ({T}) for Hankel depth {depth}.")
+
+    return np.column_stack([
+        data[i:i + depth].reshape(depth * dim)
+        for i in range(n_cols)
+    ])
+
+
+def persistent_excitation_rank(
+        u_data: np.ndarray,
+        order: int,
+        input_offset: np.ndarray = None
+    ):
+    """Return (rank, required_rank) of the input Hankel matrix H_order(u)."""
+    u_data = _as_time_major(u_data)
+    if input_offset is not None:
+        u_data = u_data - np.asarray(input_offset, dtype=float).reshape(1, -1)
+
+    H = _block_hankel(u_data, order)
+    return np.linalg.matrix_rank(H), H.shape[0]
+
+
+def check_persistent_excitation(
+        u_data: np.ndarray,
+        order: int,
+        input_offset: np.ndarray = None
+    ) -> bool:
+    """Check whether the measured input is persistently exciting of a given order."""
+    rank, required_rank = persistent_excitation_rank(u_data, order, input_offset)
+    return rank == required_rank
+
+
+def reconstruct_trajectory(
+        u_data: np.ndarray,
+        y_data: np.ndarray,
+        u_test: np.ndarray,
+        y_test: np.ndarray,
+        length: int = None,
+        input_offset: np.ndarray = None,
+        output_offset: np.ndarray = None
+    ):
+    """
+    Reconstruct one finite input-output trajectory from Hankel columns.
+
+    This helper is used to demonstrate Willems' fundamental lemma.  y_data may
+    contain either T or T+1 samples for T input samples; when it contains the
+    extra final sample, the first T outputs are used for the aligned trajectory.
+
+    Returns:
+        g, u_reconstructed, y_reconstructed, relative_error
+    """
+    u_data = _as_time_major(u_data)
+    y_data = _as_time_major(y_data)
+    u_test = _as_time_major(u_test)
+    y_test = _as_time_major(y_test)
+
+    if length is None:
+        length = u_test.shape[0]
+    if u_test.shape[0] < length or y_test.shape[0] < length:
+        raise ValueError("Test trajectory is shorter than the requested length.")
+
+    # Align input/output trajectories at the same time indices.
+    if y_data.shape[0] == u_data.shape[0] + 1:
+        y_data_aligned = y_data[:-1]
+    elif y_data.shape[0] == u_data.shape[0]:
+        y_data_aligned = y_data
+    else:
+        raise ValueError("y_data must contain T or T+1 samples for T input samples.")
+
+    if input_offset is None:
+        input_offset = np.zeros(u_data.shape[1])
+    if output_offset is None:
+        output_offset = np.zeros(y_data.shape[1])
+
+    input_offset = np.asarray(input_offset, dtype=float).reshape(1, -1)
+    output_offset = np.asarray(output_offset, dtype=float).reshape(1, -1)
+
+    u_dev = u_data - input_offset
+    y_dev = y_data_aligned - output_offset
+    u_test_dev = u_test[:length] - input_offset
+    y_test_dev = y_test[:length] - output_offset
+
+    Hu = _block_hankel(u_dev, length)
+    Hy = _block_hankel(y_dev, length)
+    n_cols = min(Hu.shape[1], Hy.shape[1])
+    W = np.vstack([Hu[:, :n_cols], Hy[:, :n_cols]])
+    w_test = np.concatenate([u_test_dev.reshape(-1), y_test_dev.reshape(-1)])
+
+    g, *_ = np.linalg.lstsq(W, w_test, rcond=None)
+    w_reconstructed = W @ g
+
+    nu = u_data.shape[1]
+    ny = y_data.shape[1]
+    n_u = length * nu
+    u_rec = w_reconstructed[:n_u].reshape(length, nu) + input_offset
+    y_rec = w_reconstructed[n_u:].reshape(length, ny) + output_offset
+
+    denom = max(np.linalg.norm(w_test), 1e-12)
+    relative_error = np.linalg.norm(w_reconstructed - w_test) / denom
+    return g, u_rec, y_rec, relative_error
+
+
+def predict_future_from_history(
+        u_data: np.ndarray,
+        y_data: np.ndarray,
+        u_ini: np.ndarray,
+        y_ini: np.ndarray,
+        u_future: np.ndarray,
+        input_offset: np.ndarray = None,
+        output_offset: np.ndarray = None
+    ):
+    """
+    Predict future outputs from past I/O and a fixed future input sequence.
+
+    The minimum-norm behavioral coefficient g is used when the constraints do
+    not uniquely determine g.  The returned `future_output_null_gain` measures
+    whether directions in the nullspace can change the future output; it is
+    approximately zero once the past horizon is long enough to determine the
+    state/output continuation.
+    """
+    from scipy.linalg import null_space
+
+    u_data = _as_time_major(u_data)
+    y_data = _as_time_major(y_data)
+    u_ini = _as_time_major(u_ini)
+    y_ini = _as_time_major(y_ini)
+    u_future = _as_time_major(u_future)
+
+    T_ini = u_ini.shape[0]
+    N = u_future.shape[0]
+    if y_ini.shape[0] != T_ini:
+        raise ValueError("u_ini and y_ini must have the same number of past samples.")
+
+    if y_data.shape[0] == u_data.shape[0] + 1:
+        y_aligned = y_data[:-1]
+    elif y_data.shape[0] == u_data.shape[0]:
+        y_aligned = y_data
+    else:
+        raise ValueError("y_data must contain T or T+1 samples for T input samples.")
+
+    if input_offset is None:
+        input_offset = np.zeros(u_data.shape[1])
+    if output_offset is None:
+        output_offset = np.zeros(y_data.shape[1])
+    input_offset = np.asarray(input_offset, dtype=float).reshape(1, -1)
+    output_offset = np.asarray(output_offset, dtype=float).reshape(1, -1)
+
+    u_dev = u_data - input_offset
+    y_dev = y_aligned - output_offset
+
+    Hu = _block_hankel(u_dev, T_ini + N)
+    Hy = _block_hankel(y_dev, T_ini + N)
+    n_cols = min(Hu.shape[1], Hy.shape[1])
+    Hu = Hu[:, :n_cols]
+    Hy = Hy[:, :n_cols]
+
+    nu = u_data.shape[1]
+    ny = y_data.shape[1]
+    Up = Hu[:T_ini * nu]
+    Uf = Hu[T_ini * nu:]
+    Yp = Hy[:T_ini * ny]
+    Yf = Hy[T_ini * ny:]
+
+    rhs = np.concatenate([
+        (u_ini - input_offset).reshape(-1),
+        (y_ini - output_offset).reshape(-1),
+        (u_future - input_offset).reshape(-1),
+    ])
+    A = np.vstack([Up, Yp, Uf])
+    g, *_ = np.linalg.lstsq(A, rhs, rcond=None)
+    equality_residual = np.linalg.norm(A @ g - rhs)
+
+    y_pred = (Yf @ g).reshape(N, ny) + output_offset
+
+    Z = null_space(A)
+    if Z.shape[1] == 0:
+        future_output_null_gain = 0.0
+    else:
+        future_output_null_gain = np.linalg.norm(Yf @ Z, ord=2)
+
+    return y_pred, g, equality_residual, future_output_null_gain
+
+
+def collect_deepc_data(
+        env: Env,
+        dynamics: Dynamics,
+        freq: float,
+        n_samples: int,
+        excitation_amplitude: float = 0.8,
+        initial_state: np.ndarray = None,
+        seed: int = 0,
+        output_indices=None
+    ):
+    """
+    Collect one open-loop trajectory for DeePC.
+
+    The excitation is centered around the equilibrium input of env.target_state.
+    By default the full state is returned as the output.  `output_indices` can be
+    used for output-only examples, e.g. output_indices=[0] for position only.
+
+    Returns:
+        u_data: shape (n_samples, nu)
+        y_data: shape (n_samples + 1, ny)
+    """
+    rng = np.random.default_rng(seed)
+    dt = 1.0 / freq
+
+    state = np.array(
+        env.target_state if initial_state is None else initial_state,
+        dtype=float
+    ).copy()
+
+    u_eq = np.atleast_1d(
+        dynamics.get_equilibrium_input(env.target_state)
+    ).astype(float)
+
+    # Random continuous excitation is persistently exciting with probability one
+    # when enough data are collected. Center it around the equilibrium input.
+    u_data = u_eq + rng.uniform(
+        -excitation_amplitude,
+        excitation_amplitude,
+        size=(n_samples, dynamics.dim_inputs)
+    )
+
+    if env.input_lbs is not None:
+        u_data = np.maximum(u_data, np.asarray(env.input_lbs))
+    if env.input_ubs is not None:
+        u_data = np.minimum(u_data, np.asarray(env.input_ubs))
+
+    x_data = np.zeros((n_samples + 1, dynamics.dim_states))
+    x_data[0] = state
+
+    for k in range(n_samples):
+        state = dynamics.one_step_forward(state, u_data[k], dt)
+        x_data[k + 1] = state
+
+    if output_indices is None:
+        y_data = x_data
+    else:
+        y_data = x_data[:, np.asarray(output_indices, dtype=int)]
+
+    return u_data, y_data
+
+
+class DeePCController:
+    """
+    Minimal deterministic / regularized DeePC controller.
+
+    Defaults reproduce the original full-state deterministic implementation:
+    - full-state output y = x,
+    - hard matching of the past output trajectory,
+    - explicit matching of the current measured output,
+    - OSQP QP in the single DeePC coefficient g.
+
+    Optional arguments are intentionally small and support the tutorial demos:
+    - output_indices: use partial outputs, e.g. [0] for position only;
+    - enforce_current_output=False: textbook output-feedback DeePC where the
+      future first output is determined only by past I/O;
+    - lambda_y>0: soften output-history matching for noisy/nonlinear cases.
+    """
+
+    def __init__(
+            self,
+            env: Env,
+            dynamics: Dynamics,
+            u_data: np.ndarray,
+            y_data: np.ndarray,
+            Q: np.ndarray,
+            R: np.ndarray,
+            Qf: np.ndarray,
+            freq: float,
+            N: int,
+            T_ini: int = 4,
+            lambda_g: float = 1e-6,
+            history_initialization: str = 'equilibrium',
+            output_indices=None,
+            enforce_current_output: bool = True,
+            lambda_y: float = None,
+            name: str = 'DeePC',
+            type: str = 'DeePC',
+            verbose: bool = False
+        ) -> None:
+
+        self.env = env
+        self.dynamics = dynamics
+        self.Q = np.asarray(Q, dtype=float)
+        self.R = np.asarray(R, dtype=float)
+        self.Qf = np.asarray(Qf, dtype=float)
+
+        self.freq = freq
+        self.dt = 1.0 / freq
+        self.N = N
+        self.T_ini = T_ini
+        self.lambda_g = lambda_g
+        self.lambda_y = lambda_y
+        self.history_initialization = history_initialization
+        self.enforce_current_output = enforce_current_output
+
+        self.name = name
+        self.type = type
+        self.verbose = verbose
+
+        self.dim_states = dynamics.dim_states
+        self.dim_inputs = dynamics.dim_inputs
+
+        self.target_state = np.asarray(env.target_state, dtype=float)
+        self.equilibrium_input = np.atleast_1d(
+            dynamics.get_equilibrium_input(self.target_state)
+        ).astype(float)
+
+        self.u_data = _as_time_major(u_data)
+        self.y_data = _as_time_major(y_data)
+        self.dim_outputs = self.y_data.shape[1]
+
+        if output_indices is None:
+            if self.dim_outputs != self.dim_states:
+                raise ValueError(
+                    "When y_data is not full-state, provide output_indices "
+                    "(e.g. output_indices=[0] for position-only output)."
+                )
+            self.output_indices = np.arange(self.dim_states)
+        else:
+            self.output_indices = np.asarray(output_indices, dtype=int).reshape(-1)
+            if len(self.output_indices) != self.dim_outputs:
+                raise ValueError("output_indices must match the number of y_data columns.")
+
+        self.target_output = self.target_state[self.output_indices]
+
+        if self.Q.shape != (self.dim_outputs, self.dim_outputs):
+            raise ValueError("Q must match the output dimension used by DeePC.")
+        if self.Qf.shape != (self.dim_outputs, self.dim_outputs):
+            raise ValueError("Qf must match the output dimension used by DeePC.")
+        if self.R.shape != (self.dim_inputs, self.dim_inputs):
+            raise ValueError("R must match the input dimension.")
+
+        if self.y_data.shape[0] != self.u_data.shape[0] + 1:
+            raise ValueError(
+                "For DeePC, y_data must contain one more sample than u_data "
+                "(y_0, ..., y_T versus u_0, ..., u_{T-1})."
+            )
+
+        self.u_history = None
+        self.y_history = None
+        self.last_output = None
+        self.last_input = None
+        self.initialized = False
+
+        self.Up = None
+        self.Yp = None
+        self.Uf = None
+        self.Yf = None
+        self.solver = None
+
+        self.setup()
+
+    def _measure_output(self, state: np.ndarray) -> np.ndarray:
+        state = np.asarray(state, dtype=float).reshape(-1)
+        return state[self.output_indices]
+
+    def initialize_history(
+            self,
+            current_state: np.ndarray,
+            mode: str = None,
+            u_history: np.ndarray = None,
+            y_history: np.ndarray = None
+        ) -> None:
+        """
+        Initialize the past trajectory used by DeePC in one place.
+
+        Default synthetic initialization:
+        - mode='equilibrium': repeat current output and equilibrium input;
+        - mode='zero': repeat current output and zero input.
+
+        For experiments or a real system with measured history, pass both
+        `u_history` and `y_history`; these must each contain T_ini samples.
+        """
+        current_output = self._measure_output(current_state)
+
+        if (u_history is None) != (y_history is None):
+            raise ValueError("Provide both u_history and y_history, or neither.")
+
+        if u_history is not None:
+            u_history = _as_time_major(u_history)
+            y_history = _as_time_major(y_history)
+            if u_history.shape != (self.T_ini, self.dim_inputs):
+                raise ValueError("u_history must have shape (T_ini, dim_inputs).")
+            if y_history.shape != (self.T_ini, self.dim_outputs):
+                raise ValueError("y_history must have shape (T_ini, dim_outputs).")
+            self.u_history = u_history.copy()
+            self.y_history = y_history.copy()
+        else:
+            mode = self.history_initialization if mode is None else mode
+            if mode == 'equilibrium':
+                u_init = self.equilibrium_input
+            elif mode == 'zero':
+                u_init = np.zeros(self.dim_inputs)
+            else:
+                raise ValueError("history initialization must be 'equilibrium' or 'zero'.")
+
+            self.u_history = np.tile(u_init, (self.T_ini, 1))
+            self.y_history = np.tile(current_output, (self.T_ini, 1))
+
+        self.last_output = current_output.copy()
+        self.last_input = None
+        self.initialized = True
+
+    def setup(self) -> None:
+        """Build the Hankel matrices and the constant part of the OSQP problem."""
+        nu = self.dim_inputs
+        ny = self.dim_outputs
+
+        # Work in deviation coordinates around the target equilibrium/output.
+        u_dev = self.u_data - self.equilibrium_input
+        y_dev = self.y_data - self.target_output
+
+        # All matrices share the same trajectory columns. y_data has one extra
+        # sample, which lets Yf contain y_0, ..., y_N like the MPC prediction.
+        n_cols = self.u_data.shape[0] - self.T_ini - self.N + 1
+        if n_cols <= 0:
+            raise ValueError("Offline dataset is too short for T_ini + N.")
+
+        Hu = _block_hankel(u_dev, self.T_ini + self.N)[:, :n_cols]
+        Hy = _block_hankel(y_dev, self.T_ini + self.N + 1)[:, :n_cols]
+
+        self.Up = Hu[:self.T_ini * nu]
+        self.Uf = Hu[self.T_ini * nu:]
+        self.Yp = Hy[:self.T_ini * ny]
+        self.Yf = Hy[self.T_ini * ny:]
+
+        # A simple PE/rank check for the offline input data.
+        pe_order = self.T_ini + self.N + self.dim_states
+        H_pe = _block_hankel(u_dev, pe_order)
+        pe_rank = np.linalg.matrix_rank(H_pe)
+        if pe_rank < H_pe.shape[0]:
+            raise ValueError(
+                f"Offline input is not persistently exciting enough: "
+                f"rank(H_{pe_order})={pe_rank}, expected {H_pe.shape[0]}."
+            )
+
+        # Cost on y_0 ... y_N and u_0 ... u_{N-1}.
+        Q_bar = sparse.block_diag(
+            [self.Q] * self.N + [self.Qf],
+            format='csc'
+        )
+        R_bar = sparse.block_diag(
+            [self.R] * self.N,
+            format='csc'
+        )
+
+        H = (
+            self.Yf.T @ Q_bar @ self.Yf
+            + self.Uf.T @ R_bar @ self.Uf
+            + self.lambda_g * np.eye(n_cols)
+        )
+
+        # In robust/noisy mode, output-history matching is a quadratic penalty
+        # instead of a hard equality.  Optionally include the current output.
+        self._Y_history_fit = self.Yp
+        if self.enforce_current_output:
+            self._Y_history_fit = np.vstack([self.Yp, self.Yf[:ny]])
+
+        if self.lambda_y is not None and self.lambda_y > 0.0:
+            H = H + self.lambda_y * (self._Y_history_fit.T @ self._Y_history_fit)
+
+        # OSQP solves 1/2 g' P g + q' g.
+        P = sparse.csc_matrix(np.triu(2.0 * np.asarray(H)))
+        q = np.zeros(n_cols)
+
+        # Hard equalities.  Input history always remains exact.  Output history
+        # is either hard (deterministic mode) or moved to the cost (robust mode).
+        hard_blocks = [self.Up]
+        self._hard_output_history = not (self.lambda_y is not None and self.lambda_y > 0.0)
+        if self._hard_output_history:
+            hard_blocks.append(self.Yp)
+            if self.enforce_current_output:
+                hard_blocks.append(self.Yf[:ny])
+
+        n_eq = sum(block.shape[0] for block in hard_blocks)
+
+        # Future input/output constraints are unchanged between the two modes.
+        A = sparse.csc_matrix(np.vstack(hard_blocks + [self.Uf, self.Yf]))
+        l = np.zeros(A.shape[0])
+        u = np.zeros(A.shape[0])
+
+        # Future input bounds in deviation coordinates.
+        idx = n_eq
+        if self.env.input_lbs is None:
+            u_lb = np.full(nu, -np.inf)
+        else:
+            u_lb = np.broadcast_to(np.asarray(self.env.input_lbs, dtype=float), (nu,))
+        if self.env.input_ubs is None:
+            u_ub = np.full(nu, np.inf)
+        else:
+            u_ub = np.broadcast_to(np.asarray(self.env.input_ubs, dtype=float), (nu,))
+
+        l[idx:idx + self.N * nu] = np.tile(u_lb - self.equilibrium_input, self.N)
+        u[idx:idx + self.N * nu] = np.tile(u_ub - self.equilibrium_input, self.N)
+        idx += self.N * nu
+
+        # Output bounds. For full-state output these are exactly state bounds;
+        # for partial outputs select only the measured/output coordinates.
+        if self.env.state_lbs is None:
+            y_lb = np.full(ny, -np.inf)
+        else:
+            y_lb = np.asarray(self.env.state_lbs, dtype=float)[self.output_indices]
+        if self.env.state_ubs is None:
+            y_ub = np.full(ny, np.inf)
+        else:
+            y_ub = np.asarray(self.env.state_ubs, dtype=float)[self.output_indices]
+
+        l[idx:] = np.tile(y_lb - self.target_output, self.N + 1)
+        u[idx:] = np.tile(y_ub - self.target_output, self.N + 1)
+
+        self._l_template = l
+        self._u_template = u
+        self._n_eq = n_eq
+        self._q_template = q
+
+        self.solver = osqp.OSQP()
+        self.solver.setup(
+            P=P,
+            q=q,
+            A=A,
+            l=l,
+            u=u,
+            verbose=self.verbose,
+            warm_start=True,
+            polish=True,
+        )
+
+        if self.verbose:
+            mode = "soft output history" if not self._hard_output_history else "hard output history"
+            print(
+                f"DeePC setup completed: {n_cols} Hankel columns, "
+                f"PE rank {pe_rank}/{H_pe.shape[0]}, {mode}."
+            )
+
+    @check_input_constraints
+    def compute_action(
+            self,
+            current_state: np.ndarray,
+            current_time: float = None
+        ):
+        """Solve the DeePC QP and return (u_0, y_prediction, u_prediction)."""
+        current_state = np.asarray(current_state, dtype=float).reshape(-1)
+        current_output = self._measure_output(current_state)
+
+        if not self.initialized:
+            self.initialize_history(current_state)
+        elif self.last_input is not None:
+            # Append the previous measured output/input pair to the past window.
+            self.u_history = np.vstack([self.u_history[1:], self.last_input])
+            self.y_history = np.vstack([self.y_history[1:], self.last_output])
+
+        u_ini = (self.u_history - self.equilibrium_input).reshape(-1)
+        y_ini = (self.y_history - self.target_output).reshape(-1)
+        y_current = current_output - self.target_output
+
+        l = self._l_template.copy()
+        u = self._u_template.copy()
+        q = self._q_template.copy()
+
+        if self._hard_output_history:
+            eq_parts = [u_ini, y_ini]
+            if self.enforce_current_output:
+                eq_parts.append(y_current)
+            b_eq = np.concatenate(eq_parts)
+        else:
+            # Only past input is hard; measured outputs enter the soft cost.
+            b_eq = u_ini
+            y_fit = y_ini
+            if self.enforce_current_output:
+                y_fit = np.concatenate([y_fit, y_current])
+            q = q - 2.0 * self.lambda_y * (self._Y_history_fit.T @ y_fit)
+
+        l[:self._n_eq] = b_eq
+        u[:self._n_eq] = b_eq
+        self.solver.update(q=q, l=l, u=u)
+
+        result = self.solver.solve()
+        if result.info.status_val not in (1, 2):
+            raise RuntimeError(f"DeePC OSQP solve failed: {result.info.status}")
+
+        g_opt = result.x
+        u_pred = (self.Uf @ g_opt).reshape(self.N, self.dim_inputs)
+        y_pred = (self.Yf @ g_opt).reshape(self.N + 1, self.dim_outputs)
+
+        # Transform predictions back to physical coordinates.
+        u_pred = u_pred + self.equilibrium_input
+        y_pred = y_pred + self.target_output
+        u_optimal = u_pred[0].copy()
+
+        # Store the output/input pair for the next receding-horizon update.
+        self.last_output = current_output.copy()
+        self.last_input = u_optimal.copy()
+
+        if self.verbose:
+            print(f"Optimal control action: {u_optimal}")
+            print(f"y_pred: {y_pred}")
+            print(f"u_pred: {u_pred}")
+
+        return u_optimal, y_pred, u_pred
