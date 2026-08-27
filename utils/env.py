@@ -17,7 +17,8 @@ class Env:
             target_state: np.ndarray,
             symbolic_h_mean_ext_case: Callable[[ca.Function], ca.Function] = None, 
             symbolic_h_mean_ext: Callable[[ca.Function], ca.Function] = None, 
-            symbolic_h_cov_ext: Callable[[ca.Function], ca.Function] = None, 
+            symbolic_h_cov_ext: Callable[[ca.Function], ca.Function] = None,
+            symbolic_dh_cov_ext: Callable[[ca.Function], ca.Function] = None,
             symbolic_theta_ext: Callable[[ca.Function], ca.Function] = None,
             param: float = None,
             state_lbs: np.ndarray = None, 
@@ -81,11 +82,21 @@ class Env:
                 return h
             self.h = ca.Function("h", [p], [symbolic_h_mean_ext_case(p, case)]) # function of height h w.r.t. p
         
-        # Set functions h_cov(p) based on given expression
+        # Set functions h_cov(p) = Var[h(p)] based on given expression
         if symbolic_h_cov_ext:
             self.h_cov = symbolic_h_cov_ext
         else:
             self.h_cov = None
+
+        # Set functions dh_cov(p) = Var[h'(p)], the variance of the terrain
+        # slope. For a model h(p) = phi(p)^T theta with theta ~ N(mu, Sigma),
+        # this is phi'(p)^T Sigma phi'(p). It is NOT the derivative of Var[h(p)]
+        # (2 phi'^T Sigma phi, which has different units and can be negative),
+        # so it has to be supplied separately from h_cov.
+        if symbolic_dh_cov_ext:
+            self.dh_cov = symbolic_dh_cov_ext
+        else:
+            self.dh_cov = None
         
         # Set functions theta(p) based on symbolic parameters or given expression
         if not symbolic_theta_ext:
@@ -402,7 +413,14 @@ class Dynamics:
         ) -> None:
         """
         Build CasADi expressions for continuous-time and discrete-time
-        process noise covariance matrices based on self.env.h and self.env.h_cov.
+        process noise covariance matrices based on self.env.h (mean terrain)
+        and self.env.dh_cov (variance of the terrain slope h'(p)).
+
+        The uncertain quantity entering the dynamics is the slope z = h'(p)
+        through cos(atan z) and sin(atan z) cos(atan z). Its mean is the
+        derivative of the mean terrain, and its variance must be provided as
+        Var[h'(p)] (for h = phi^T theta: phi'^T Sigma_theta phi'). Note that
+        d/dp Var[h(p)] is a different quantity and must not be used here.
 
         Stores:
         - self.dynamics_variance_function_cont: continuous-time Σ^w(x,u)
@@ -417,14 +435,17 @@ class Dynamics:
 
         Gravity = 9.81
 
-        # Automatic differentiation of h(p) and Var[h(p)]
-        mu_h = self.env.h(p)
-        dmu_h = ca.gradient(mu_h, p)
-        sigma_h2 = self.env.h_cov(p)
-        dsigma_h2 = ca.gradient(sigma_h2, p)
+        if getattr(self.env, "dh_cov", None) is None:
+            raise ValueError(
+                "build_stochastic_model needs env.dh_cov(p) = Var[h'(p)] "
+                "(pass symbolic_dh_cov_ext to Env). Var[h(p)] alone does not "
+                "determine the slope variance."
+            )
 
-        mu_dh = dmu_h
-        sigma_dh = ca.fabs(dsigma_h2)  # safety clamp to non-negative
+        # Mean slope from the mean terrain, slope variance from the model
+        mu_h = self.env.h(p)
+        mu_dh = ca.gradient(mu_h, p)
+        sigma_dh = self.env.dh_cov(p)
 
         # Mean of trig terms
         denom = ca.sqrt(1 + mu_dh**2)

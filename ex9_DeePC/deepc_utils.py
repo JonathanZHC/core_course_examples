@@ -271,21 +271,186 @@ def collect_deepc_data(
     return u_data, y_data
 
 
+def collect_deepc_data_closed_loop(
+        env: Env,
+        dynamics: Dynamics,
+        freq: float,
+        n_samples: int,
+        feedback_gain: np.ndarray,
+        excitation_amplitude: float = 0.6,
+        initial_state: np.ndarray = None,
+        seed: int = 0,
+        output_indices=None
+    ):
+    """
+    Collect one closed-loop trajectory for DeePC around env.target_state.
+
+    Open-loop excitation (collect_deepc_data) is fine on a flat, marginally
+    stable plant, but on a non-flat terrain a constant input offset makes the
+    car roll away and the data leave the region of interest.  Here a simple
+    stabilizing feedback keeps the car near the target while random excitation
+    is added on top:
+
+        u_k = u_eq - K (x_k - x_target) + e_k,   e_k ~ U(-a, a).
+
+    Because e_k is random, the applied input remains persistently exciting
+    (closed-loop identification).  The result is a *local* dataset, i.e. the
+    Hankel matrices describe the plant's behavior near the target only.
+
+    Returns:
+        u_data: shape (n_samples, nu)
+        y_data: shape (n_samples + 1, ny)
+    """
+    rng = np.random.default_rng(seed)
+    dt = 1.0 / freq
+    K = np.asarray(feedback_gain, dtype=float).reshape(dynamics.dim_inputs, dynamics.dim_states)
+    target = np.asarray(env.target_state, dtype=float)
+
+    state = np.array(target if initial_state is None else initial_state, dtype=float).copy()
+    u_eq = np.atleast_1d(dynamics.get_equilibrium_input(target)).astype(float)
+
+    u_data = np.zeros((n_samples, dynamics.dim_inputs))
+    x_data = np.zeros((n_samples + 1, dynamics.dim_states))
+    x_data[0] = state
+
+    for k in range(n_samples):
+        u = u_eq - K @ (state - target) + rng.uniform(
+            -excitation_amplitude, excitation_amplitude, size=dynamics.dim_inputs
+        )
+        if env.input_lbs is not None:
+            u = np.maximum(u, np.asarray(env.input_lbs))
+        if env.input_ubs is not None:
+            u = np.minimum(u, np.asarray(env.input_ubs))
+        u_data[k] = u
+        state = dynamics.one_step_forward(state, u, dt)
+        x_data[k + 1] = state
+
+    if output_indices is None:
+        y_data = x_data
+    else:
+        y_data = x_data[:, np.asarray(output_indices, dtype=int)]
+
+    return u_data, y_data
+
+
+class NonlinearMPCOracle:
+    """
+    Reference nonlinear MPC with the *true* plant model (tutorial oracle only).
+
+    Multiple-shooting transcription with an RK4 step of the exact dynamics,
+    solved with CasADi/ipopt and warm-started by shifting the previous
+    solution.  It exists to show what is achievable when the nonlinear model
+    is known; DeePC and the linear MPC never see this information.
+    """
+
+    def __init__(
+            self,
+            env: Env,
+            dynamics: Dynamics,
+            Q: np.ndarray,
+            R: np.ndarray,
+            Qf: np.ndarray,
+            freq: float,
+            N: int,
+            name: str = 'NMPC_oracle',
+            type: str = 'NMPC',
+            verbose: bool = False
+        ) -> None:
+        import casadi as ca
+
+        self.env = env
+        self.dynamics = dynamics
+        self.freq = freq
+        self.dt = 1.0 / freq
+        self.N = int(N)
+        self.name = name
+        self.type = type
+        self.verbose = verbose
+
+        self.target_state = np.asarray(env.target_state, dtype=float)
+        self.u_eq = float(np.atleast_1d(dynamics.get_equilibrium_input(self.target_state))[0])
+        f = dynamics.dynamics_function
+        dt = self.dt
+
+        def rk4(x, u):
+            k1 = f(x, u)
+            k2 = f(x + dt / 2 * k1, u)
+            k3 = f(x + dt / 2 * k2, u)
+            k4 = f(x + dt * k3, u)
+            return x + dt / 6 * (k1 + 2 * k2 + 2 * k3 + k4)
+
+        nx, nu = dynamics.dim_states, dynamics.dim_inputs
+        opti = ca.Opti()
+        X = opti.variable(nx, self.N + 1)
+        U = opti.variable(nu, self.N)
+        x0 = opti.parameter(nx)
+        cost = 0
+        for i in range(self.N):
+            opti.subject_to(X[:, i + 1] == rk4(X[:, i], U[:, i]))
+            dx = X[:, i] - self.target_state
+            du = U[:, i] - self.u_eq
+            cost += ca.mtimes([dx.T, ca.DM(Q), dx]) + ca.mtimes([du.T, ca.DM(R), du])
+            if env.input_lbs is not None:
+                opti.subject_to(U[:, i] >= env.input_lbs)
+            if env.input_ubs is not None:
+                opti.subject_to(U[:, i] <= env.input_ubs)
+            if env.state_lbs is not None:
+                opti.subject_to(X[:, i + 1] >= ca.DM(np.asarray(env.state_lbs, dtype=float)))
+            if env.state_ubs is not None:
+                opti.subject_to(X[:, i + 1] <= ca.DM(np.asarray(env.state_ubs, dtype=float)))
+        dx = X[:, self.N] - self.target_state
+        cost += ca.mtimes([dx.T, ca.DM(Qf), dx])
+        opti.subject_to(X[:, 0] == x0)
+        opti.minimize(cost)
+        opti.solver(
+            "ipopt",
+            {"print_time": False},
+            {"print_level": 0, "max_iter": 500, "sb": "yes"},
+        )
+        self._opti, self._X, self._U, self._x0 = opti, X, U, x0
+        self._previous = None
+
+    def setup(self) -> None:
+        pass
+
+    def compute_action(self, current_state: np.ndarray, current_time=None):
+        """Return (u_0, x_prediction, u_prediction) like the MPC controllers."""
+        self._opti.set_value(self._x0, np.asarray(current_state, dtype=float))
+        if self._previous is not None:
+            self._opti.set_initial(self._X, self._previous[0])
+            self._opti.set_initial(self._U, self._previous[1])
+        try:
+            sol = self._opti.solve()
+        except RuntimeError as exc:
+            raise RuntimeError(f"NMPC oracle solve failed: {exc}") from exc
+        X = np.array(sol.value(self._X)).reshape(self.dynamics.dim_states, self.N + 1)
+        U = np.array(sol.value(self._U)).reshape(self.dynamics.dim_inputs, self.N)
+        # Warm start for the next step: shift the plan by one sample.
+        self._previous = (
+            np.hstack([X[:, 1:], X[:, -1:]]),
+            np.hstack([U[:, 1:], U[:, -1:]]),
+        )
+        return U[:, 0].copy(), X.T.copy(), U.T.copy()
+
+
 class DeePCController:
     """
     Minimal deterministic / regularized DeePC controller.
 
-    Defaults reproduce the original full-state deterministic implementation:
-    - full-state output y = x,
+    Deterministic defaults:
     - hard matching of the past output trajectory,
     - explicit matching of the current measured output,
     - OSQP QP in the single DeePC coefficient g.
 
     Optional arguments are intentionally small and support the tutorial demos:
-    - output_indices: use partial outputs, e.g. [0] for position only;
+    - output_indices: which state coordinates are measured. The Chapter 9
+      notebooks use position-only output, output_indices=[0] (y_data with one
+      column and scalar Q, Qf). Without it the full state is the output;
     - enforce_current_output=False: textbook output-feedback DeePC where the
       future first output is determined only by past I/O;
-    - lambda_y>0: soften output-history matching for noisy/nonlinear cases.
+    - lambda_y>0: soften output-history matching for noisy/nonlinear cases;
+    - enforce_pe_check=False: build the controller even if the offline input is
+      not persistently exciting (for demonstrations of what then goes wrong).
     """
 
     def __init__(
@@ -307,10 +472,12 @@ class DeePCController:
             lambda_y: float = None,
             name: str = 'DeePC',
             type: str = 'DeePC',
-            verbose: bool = False
+            verbose: bool = False,
+            enforce_pe_check: bool = True,
         ) -> None:
 
         self.env = env
+        self.enforce_pe_check = enforce_pe_check
         self.dynamics = dynamics
         self.Q = np.asarray(Q, dtype=float)
         self.R = np.asarray(R, dtype=float)
@@ -460,7 +627,8 @@ class DeePCController:
         pe_order = self.T_ini + self.N + self.dim_states
         H_pe = _block_hankel(u_dev, pe_order)
         pe_rank = np.linalg.matrix_rank(H_pe)
-        if pe_rank < H_pe.shape[0]:
+        self.pe_rank, self.pe_required_rank = int(pe_rank), int(H_pe.shape[0])
+        if pe_rank < H_pe.shape[0] and self.enforce_pe_check:
             raise ValueError(
                 f"Offline input is not persistently exciting enough: "
                 f"rank(H_{pe_order})={pe_rank}, expected {H_pe.shape[0]}."
@@ -614,6 +782,15 @@ class DeePCController:
         u_pred = (self.Uf @ g_opt).reshape(self.N, self.dim_inputs)
         y_pred = (self.Yf @ g_opt).reshape(self.N + 1, self.dim_outputs)
 
+        # Diagnostics for the tutorial notebooks: the behavioral coefficient,
+        # the pure OSQP solve time, and the output-history fit residual
+        # ||Y_fit g - y_meas|| (identically ~0 in the hard-constrained mode).
+        self.last_g = g_opt.copy()
+        self.last_solve_time = float(result.info.solve_time)
+        self.last_run_time = float(result.info.run_time)
+        y_fit_meas = y_ini if not self.enforce_current_output else np.concatenate([y_ini, y_current])
+        self.last_output_residual = float(np.linalg.norm(self._Y_history_fit @ g_opt - y_fit_meas))
+
         # Transform predictions back to physical coordinates.
         u_pred = u_pred + self.equilibrium_input
         y_pred = y_pred + self.target_output
@@ -629,3 +806,214 @@ class DeePCController:
             print(f"u_pred: {u_pred}")
 
         return u_optimal, y_pred, u_pred
+
+
+"""------Model-based predictive control in ARX form (oracle / indirect baseline)------"""
+
+
+def true_arx_double_integrator(dt: float) -> tuple[np.ndarray, np.ndarray]:
+    """Exact zero-order-hold ARX model of the flat Mountain Car, p_ddot = u.
+
+        p_{k+1} = 2 p_k - p_{k-1} + (dt^2 / 2) (u_k + u_{k-1})
+
+    Returns (a, b) with a = [a_1, a_2], b = [b_1, b_2] in
+        y_{k+1} = a_1 y_k + a_2 y_{k-1} + b_1 u_k + b_2 u_{k-1}.
+    """
+    return np.array([2.0, -1.0]), np.array([0.5 * dt**2, 0.5 * dt**2])
+
+
+def identify_arx_least_squares(
+        u_data: np.ndarray,
+        y_data: np.ndarray,
+        order: int = 2,
+        input_offset: np.ndarray = None,
+        output_offset: np.ndarray = None,
+    ) -> tuple[np.ndarray, np.ndarray, float]:
+    """Ordinary least squares fit of a SISO ARX(order, order) model.
+
+        y_{k+1} = sum_i a_i y_{k+1-i} + sum_i b_i u_{k+1-i},   i = 1..order
+
+    in deviation coordinates.  This is the textbook *indirect* route: first a
+    model, then a controller.  With output noise the regressors are noisy too
+    (errors in variables), so the estimate is biased; nothing is done about
+    that here on purpose.
+
+    Returns (a, b, one_step_rms_residual).
+    """
+    u = _as_time_major(u_data)[:, 0]
+    y = _as_time_major(y_data)[:, 0]
+    if input_offset is not None:
+        u = u - float(np.asarray(input_offset).reshape(-1)[0])
+    if output_offset is not None:
+        y = y - float(np.asarray(output_offset).reshape(-1)[0])
+    T = u.shape[0]
+    y = y[:T + 1] if y.shape[0] >= T + 1 else y
+
+    rows, targets = [], []
+    for k in range(order - 1, min(T, y.shape[0] - 1)):
+        rows.append(np.concatenate([[y[k - i] for i in range(order)], [u[k - i] for i in range(order)]]))
+        targets.append(y[k + 1])
+    Phi = np.asarray(rows)
+    Y = np.asarray(targets)
+    theta, *_ = np.linalg.lstsq(Phi, Y, rcond=None)
+    residual = float(np.sqrt(np.mean((Phi @ theta - Y)**2)))
+    return theta[:order], theta[order:], residual
+
+
+class ARXPredictiveController:
+    """
+    Linear predictive controller built from an ARX model, on the same OSQP
+    backend, with the same cost, constraints and receding history as the
+    DeePC controller.  Used as
+      - the *oracle* (true ARX model of the flat plant),
+      - the *indirect* data-driven controller (ARX identified from data),
+      - a fair computational baseline (decision variable u_f, dimension N).
+
+    The predictor is exact in deviation coordinates:
+        y_f = M_y y_hist + M_u u_hist + Gamma u_f,
+    where the history holds the last `order` outputs (including the current
+    one) and the last `order - 1` inputs.  Output = position only.
+    """
+
+    def __init__(
+            self,
+            env: Env,
+            dynamics: Dynamics,
+            a: np.ndarray,
+            b: np.ndarray,
+            Q: np.ndarray,
+            R: np.ndarray,
+            Qf: np.ndarray,
+            freq: float,
+            N: int,
+            output_indices=(0,),
+            name: str = 'ARX-MPC',
+            type: str = 'MPC',
+            verbose: bool = False,
+            tolerance: float = 1e-6,
+        ) -> None:
+        self.env = env
+        self.dynamics = dynamics
+        self.a = np.asarray(a, dtype=float).reshape(-1)
+        self.b = np.asarray(b, dtype=float).reshape(-1)
+        self.order = self.a.shape[0]
+        if self.b.shape[0] != self.order:
+            raise ValueError("a and b must have the same length (ARX order).")
+        self.Q = np.asarray(Q, dtype=float).reshape(1, 1)
+        self.R = np.asarray(R, dtype=float).reshape(1, 1)
+        self.Qf = np.asarray(Qf, dtype=float).reshape(1, 1)
+        self.freq = freq
+        self.dt = 1.0 / freq
+        self.N = int(N)
+        self.name, self.type, self.verbose = name, type, verbose
+        self.tolerance = float(tolerance)
+        self.output_indices = np.asarray(output_indices, dtype=int).reshape(-1)
+        self.dim_inputs = dynamics.dim_inputs
+        self.target_state = np.asarray(env.target_state, dtype=float)
+        self.target_output = float(self.target_state[self.output_indices][0])
+        self.equilibrium_input = float(np.atleast_1d(dynamics.get_equilibrium_input(self.target_state))[0])
+
+        self.y_history = None   # last `order` outputs (deviation), newest last
+        self.u_history = None   # last `order - 1` inputs (deviation), newest last
+        self.last_input = None
+        self.initialized = False
+        self.last_solve_time = None
+        self.last_run_time = None
+        self.setup()
+
+    # -- lifted predictor -------------------------------------------------
+    def _state_space(self):
+        """Observable realization with state s_k = [y_k, ..., y_{k-n+1}, u_{k-1}, ..., u_{k-n+1}]."""
+        n = self.order
+        ns = n + (n - 1)
+        A = np.zeros((ns, ns)); B = np.zeros((ns, 1))
+        A[0, :n] = self.a
+        A[0, n:] = self.b[1:]
+        B[0, 0] = self.b[0]
+        for i in range(1, n):
+            A[i, i - 1] = 1.0
+        if n > 1:
+            B[n, 0] = 1.0
+            for i in range(n + 1, ns):
+                A[i, i - 1] = 1.0
+        C = np.zeros((1, ns)); C[0, 0] = 1.0
+        return A, B, C
+
+    def setup(self) -> None:
+        A, B, C = self._state_space()
+        ns = A.shape[0]
+        N = self.N
+        # y_{1..N} = Phi s_0 + Gamma u_{0..N-1}
+        Phi = np.zeros((N, ns)); Gamma = np.zeros((N, N))
+        Ak = np.eye(ns)
+        powers = [Ak]
+        for k in range(1, N + 1):
+            Ak = A @ Ak
+            powers.append(Ak)
+        for i in range(1, N + 1):
+            Phi[i - 1] = (C @ powers[i]).ravel()
+            for j in range(i):
+                Gamma[i - 1, j] = float(C @ powers[i - 1 - j] @ B)
+        self.Phi, self.Gamma = Phi, Gamma
+        q_diag = np.array([self.Q[0, 0]] * (N - 1) + [self.Qf[0, 0]])
+        self._Qbar = np.diag(q_diag)
+        H = Gamma.T @ self._Qbar @ Gamma + self.R[0, 0] * np.eye(N)
+        self._P = sparse.csc_matrix(np.triu(2.0 * H))
+        # constraints: u bounds (identity rows) and y bounds (Gamma rows)
+        self._A = sparse.csc_matrix(np.vstack([np.eye(N), Gamma]))
+        u_lb = -np.inf if self.env.input_lbs is None else float(np.broadcast_to(self.env.input_lbs, (1,))[0])
+        u_ub = np.inf if self.env.input_ubs is None else float(np.broadcast_to(self.env.input_ubs, (1,))[0])
+        y_lb = -np.inf if self.env.state_lbs is None else float(np.asarray(self.env.state_lbs)[self.output_indices][0])
+        y_ub = np.inf if self.env.state_ubs is None else float(np.asarray(self.env.state_ubs)[self.output_indices][0])
+        self._l = np.concatenate([np.full(N, u_lb - self.equilibrium_input), np.full(N, y_lb - self.target_output)])
+        self._u = np.concatenate([np.full(N, u_ub - self.equilibrium_input), np.full(N, y_ub - self.target_output)])
+        self.solver = osqp.OSQP()
+        self.solver.setup(P=self._P, q=np.zeros(N), A=self._A, l=self._l, u=self._u,
+                          verbose=self.verbose, warm_start=True, polish=True,
+                          eps_abs=self.tolerance, eps_rel=self.tolerance)
+
+    # -- history handling (mirrors DeePCController) ---------------------------
+    def _measure_output(self, state) -> float:
+        return float(np.asarray(state, dtype=float).reshape(-1)[self.output_indices][0])
+
+    def initialize_history(self, current_state, u_history=None, y_history=None) -> None:
+        y0 = self._measure_output(current_state) - self.target_output
+        n = self.order
+        if y_history is not None:
+            y_hist = np.asarray(y_history, dtype=float).reshape(-1) - self.target_output
+            u_hist = np.asarray(u_history, dtype=float).reshape(-1) - self.equilibrium_input
+            self.y_history = np.concatenate([y_hist, [y0]])[-n:]
+            self.u_history = u_hist[-(n - 1):] if n > 1 else np.zeros(0)
+        else:
+            self.y_history = np.full(n, y0)
+            self.u_history = np.zeros(n - 1)
+        self.last_input = None
+        self.initialized = True
+
+    @check_input_constraints
+    def compute_action(self, current_state, current_time=None):
+        y0 = self._measure_output(current_state) - self.target_output
+        if not self.initialized:
+            self.initialize_history(current_state)
+        elif self.last_input is not None:
+            self.y_history = np.concatenate([self.y_history[1:], [y0]])
+            if self.order > 1:
+                self.u_history = np.concatenate([self.u_history[1:], [self.last_input - self.equilibrium_input]])
+        s0 = np.concatenate([self.y_history[::-1], self.u_history[::-1]])   # newest first
+        y_free = self.Phi @ s0
+        q = 2.0 * (self.Gamma.T @ self._Qbar @ y_free)
+        N = self.N
+        l = self._l.copy(); u = self._u.copy()
+        l[N:] -= y_free; u[N:] -= y_free
+        self.solver.update(q=q, l=l, u=u)
+        result = self.solver.solve()
+        if result.info.status_val not in (1, 2):
+            raise RuntimeError(f"ARX-MPC OSQP solve failed: {result.info.status}")
+        self.last_solve_time = float(result.info.solve_time)
+        self.last_run_time = float(result.info.run_time)
+        u_f = result.x
+        y_pred = np.concatenate([[y0], y_free + self.Gamma @ u_f]) + self.target_output
+        u_pred = (u_f + self.equilibrium_input).reshape(N, 1)
+        u_optimal = np.array([u_pred[0, 0]])
+        self.last_input = float(u_optimal[0])
+        return u_optimal, y_pred.reshape(N + 1, 1), u_pred
