@@ -112,7 +112,7 @@ class Simulator:
                     current_state = self.dynamics.one_step_forward(current_state, current_input, self.dt)
             else:
                 # Get current state, and call controller to calculate input
-                if self.controller.type in ['MPC', 'DeePC']:
+                if self.controller.type == 'MPC':
                     input_cmd, state_pred, input_pred = self.controller.compute_action(current_state, self.counter)
                     # Log the predictions
                     self.state_pred_traj.append(state_pred)

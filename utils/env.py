@@ -17,7 +17,7 @@ class Env:
             target_state: np.ndarray,
             symbolic_h_mean_ext_case: Callable[[ca.Function], ca.Function] = None, 
             symbolic_h_mean_ext: Callable[[ca.Function], ca.Function] = None, 
-            symbolic_h_cov_ext: Callable[[ca.Function], ca.Function] = None,
+            symbolic_h_cov_ext: Callable[[ca.Function], ca.Function] = None, 
             symbolic_dh_cov_ext: Callable[[ca.Function], ca.Function] = None,
             symbolic_theta_ext: Callable[[ca.Function], ca.Function] = None,
             param: float = None,
@@ -82,17 +82,19 @@ class Env:
                 return h
             self.h = ca.Function("h", [p], [symbolic_h_mean_ext_case(p, case)]) # function of height h w.r.t. p
         
-        # Set functions h_cov(p) = Var[h(p)] based on given expression
+        # Set functions h_cov(p) based on given expression
         if symbolic_h_cov_ext:
             self.h_cov = symbolic_h_cov_ext
         else:
             self.h_cov = None
 
-        # Set functions dh_cov(p) = Var[h'(p)], the variance of the terrain
-        # slope. For a model h(p) = phi(p)^T theta with theta ~ N(mu, Sigma),
-        # this is phi'(p)^T Sigma phi'(p). It is NOT the derivative of Var[h(p)]
-        # (2 phi'^T Sigma phi, which has different units and can be negative),
-        # so it has to be supplied separately from h_cov.
+        # Set the variance of the *slope*, Var[h'(p)], based on given expression.
+        # The dynamics depend on h only through the inclination theta(p) = atan(h'(p)),
+        # so this - and not the variance of h itself - is what propagates into the
+        # process noise covariance. Note that Var[h'(p)] cannot be recovered from the
+        # marginal variance Var[h(p)]: it is the second mixed derivative of the joint
+        # covariance, d^2/dp dp' Cov[h(p), h(p')] evaluated at p' = p, and must
+        # therefore be supplied by the model that produced h_cov.
         if symbolic_dh_cov_ext:
             self.dh_cov = symbolic_dh_cov_ext
         else:
@@ -413,14 +415,7 @@ class Dynamics:
         ) -> None:
         """
         Build CasADi expressions for continuous-time and discrete-time
-        process noise covariance matrices based on self.env.h (mean terrain)
-        and self.env.dh_cov (variance of the terrain slope h'(p)).
-
-        The uncertain quantity entering the dynamics is the slope z = h'(p)
-        through cos(atan z) and sin(atan z) cos(atan z). Its mean is the
-        derivative of the mean terrain, and its variance must be provided as
-        Var[h'(p)] (for h = phi^T theta: phi'^T Sigma_theta phi'). Note that
-        d/dp Var[h(p)] is a different quantity and must not be used here.
+        process noise covariance matrices based on self.env.h and self.env.h_cov.
 
         Stores:
         - self.dynamics_variance_function_cont: continuous-time Σ^w(x,u)
@@ -435,17 +430,21 @@ class Dynamics:
 
         Gravity = 9.81
 
-        if getattr(self.env, "dh_cov", None) is None:
-            raise ValueError(
-                "build_stochastic_model needs env.dh_cov(p) = Var[h'(p)] "
-                "(pass symbolic_dh_cov_ext to Env). Var[h(p)] alone does not "
-                "determine the slope variance."
-            )
-
-        # Mean slope from the mean terrain, slope variance from the model
+        # Mean slope by automatic differentiation of h(p)
         mu_h = self.env.h(p)
         mu_dh = ca.gradient(mu_h, p)
-        sigma_dh = self.env.dh_cov(p)
+
+        # Variance of the slope Var[h'(p)]. When the learned model supplies it
+        # (symbolic_dh_cov_ext, see Chapter 6.3) it is used directly: for a model that
+        # is linear in the parameters this is phi'(p)^T Sigma phi'(p), for a GP it is
+        # the second mixed derivative of the posterior covariance. Otherwise fall back
+        # to the original approximation of Chapter 6.2, the derivative of the marginal
+        # variance Var[h(p)], which is kept so that the earlier notebooks run unchanged.
+        if getattr(self.env, "dh_cov", None) is not None:
+            sigma_dh = self.env.dh_cov(p)
+        else:
+            sigma_h2 = self.env.h_cov(p)
+            sigma_dh = ca.fabs(ca.gradient(sigma_h2, p))  # safety clamp to non-negative
 
         # Mean of trig terms
         denom = ca.sqrt(1 + mu_dh**2)

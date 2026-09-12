@@ -6,7 +6,7 @@ from utils.env import Env, Dynamics
 from utils.controller import check_input_constraints
 
 
-'''------Implementation of DeePC------'''
+'''------Implementation of DeePC (Chapter 6.4)------'''
 
 
 def _as_time_major(data: np.ndarray) -> np.ndarray:
@@ -49,14 +49,6 @@ def persistent_excitation_rank(
     return np.linalg.matrix_rank(H), H.shape[0]
 
 
-def check_persistent_excitation(
-        u_data: np.ndarray,
-        order: int,
-        input_offset: np.ndarray = None
-    ) -> bool:
-    """Check whether the measured input is persistently exciting of a given order."""
-    rank, required_rank = persistent_excitation_rank(u_data, order, input_offset)
-    return rank == required_rank
 
 
 def reconstruct_trajectory(
@@ -129,85 +121,6 @@ def reconstruct_trajectory(
     return g, u_rec, y_rec, relative_error
 
 
-def predict_future_from_history(
-        u_data: np.ndarray,
-        y_data: np.ndarray,
-        u_ini: np.ndarray,
-        y_ini: np.ndarray,
-        u_future: np.ndarray,
-        input_offset: np.ndarray = None,
-        output_offset: np.ndarray = None
-    ):
-    """
-    Predict future outputs from past I/O and a fixed future input sequence.
-
-    The minimum-norm behavioral coefficient g is used when the constraints do
-    not uniquely determine g.  The returned `future_output_null_gain` measures
-    whether directions in the nullspace can change the future output; it is
-    approximately zero once the past horizon is long enough to determine the
-    state/output continuation.
-    """
-    from scipy.linalg import null_space
-
-    u_data = _as_time_major(u_data)
-    y_data = _as_time_major(y_data)
-    u_ini = _as_time_major(u_ini)
-    y_ini = _as_time_major(y_ini)
-    u_future = _as_time_major(u_future)
-
-    T_ini = u_ini.shape[0]
-    N = u_future.shape[0]
-    if y_ini.shape[0] != T_ini:
-        raise ValueError("u_ini and y_ini must have the same number of past samples.")
-
-    if y_data.shape[0] == u_data.shape[0] + 1:
-        y_aligned = y_data[:-1]
-    elif y_data.shape[0] == u_data.shape[0]:
-        y_aligned = y_data
-    else:
-        raise ValueError("y_data must contain T or T+1 samples for T input samples.")
-
-    if input_offset is None:
-        input_offset = np.zeros(u_data.shape[1])
-    if output_offset is None:
-        output_offset = np.zeros(y_data.shape[1])
-    input_offset = np.asarray(input_offset, dtype=float).reshape(1, -1)
-    output_offset = np.asarray(output_offset, dtype=float).reshape(1, -1)
-
-    u_dev = u_data - input_offset
-    y_dev = y_aligned - output_offset
-
-    Hu = _block_hankel(u_dev, T_ini + N)
-    Hy = _block_hankel(y_dev, T_ini + N)
-    n_cols = min(Hu.shape[1], Hy.shape[1])
-    Hu = Hu[:, :n_cols]
-    Hy = Hy[:, :n_cols]
-
-    nu = u_data.shape[1]
-    ny = y_data.shape[1]
-    Up = Hu[:T_ini * nu]
-    Uf = Hu[T_ini * nu:]
-    Yp = Hy[:T_ini * ny]
-    Yf = Hy[T_ini * ny:]
-
-    rhs = np.concatenate([
-        (u_ini - input_offset).reshape(-1),
-        (y_ini - output_offset).reshape(-1),
-        (u_future - input_offset).reshape(-1),
-    ])
-    A = np.vstack([Up, Yp, Uf])
-    g, *_ = np.linalg.lstsq(A, rhs, rcond=None)
-    equality_residual = np.linalg.norm(A @ g - rhs)
-
-    y_pred = (Yf @ g).reshape(N, ny) + output_offset
-
-    Z = null_space(A)
-    if Z.shape[1] == 0:
-        future_output_null_gain = 0.0
-    else:
-        future_output_null_gain = np.linalg.norm(Yf @ Z, ord=2)
-
-    return y_pred, g, equality_residual, future_output_null_gain
 
 
 def collect_deepc_data(
@@ -443,8 +356,8 @@ class DeePCController:
     - OSQP QP in the single DeePC coefficient g.
 
     Optional arguments are intentionally small and support the tutorial demos:
-    - output_indices: which state coordinates are measured. The Chapter 9
-      notebooks use position-only output, output_indices=[0] (y_data with one
+    - output_indices: which state coordinates are measured. The Chapter 6.4
+      notebook uses position-only output, output_indices=[0] (y_data with one
       column and scalar Q, Qf). Without it the full state is the output;
     - enforce_current_output=False: textbook output-feedback DeePC where the
       future first output is determined only by past I/O;
@@ -470,8 +383,9 @@ class DeePCController:
             output_indices=None,
             enforce_current_output: bool = True,
             lambda_y: float = None,
+            velocity_bounds: tuple = None,
             name: str = 'DeePC',
-            type: str = 'DeePC',
+            type: str = 'MPC',
             verbose: bool = False,
             enforce_pe_check: bool = True,
         ) -> None:
@@ -491,6 +405,10 @@ class DeePCController:
         self.lambda_y = lambda_y
         self.history_initialization = history_initialization
         self.enforce_current_output = enforce_current_output
+        # Optional bounds on the finite-difference velocity (y_{i+1} - y_i) / dt of a
+        # single (position) output, so that a speed limit can be imposed although the
+        # velocity itself is never measured.
+        self.velocity_bounds = velocity_bounds
 
         self.name = name
         self.type = type
@@ -675,7 +593,13 @@ class DeePCController:
         n_eq = sum(block.shape[0] for block in hard_blocks)
 
         # Future input/output constraints are unchanged between the two modes.
-        A = sparse.csc_matrix(np.vstack(hard_blocks + [self.Uf, self.Yf]))
+        vel_blocks = []
+        if self.velocity_bounds is not None:
+            if ny != 1:
+                raise ValueError("velocity_bounds requires a single (position) output.")
+            D = (np.eye(self.N + 1, k=1) - np.eye(self.N + 1))[:-1] / self.dt   # (N, N+1) forward differences
+            vel_blocks = [D @ self.Yf]
+        A = sparse.csc_matrix(np.vstack(hard_blocks + [self.Uf, self.Yf] + vel_blocks))
         l = np.zeros(A.shape[0])
         u = np.zeros(A.shape[0])
 
@@ -705,8 +629,14 @@ class DeePCController:
         else:
             y_ub = np.asarray(self.env.state_ubs, dtype=float)[self.output_indices]
 
-        l[idx:] = np.tile(y_lb - self.target_output, self.N + 1)
-        u[idx:] = np.tile(y_ub - self.target_output, self.N + 1)
+        l[idx:idx + (self.N + 1) * ny] = np.tile(y_lb - self.target_output, self.N + 1)
+        u[idx:idx + (self.N + 1) * ny] = np.tile(y_ub - self.target_output, self.N + 1)
+        idx += (self.N + 1) * ny
+
+        # Velocity bounds on the output differences (offsets cancel in the difference).
+        if vel_blocks:
+            l[idx:] = self.velocity_bounds[0]
+            u[idx:] = self.velocity_bounds[1]
 
         self._l_template = l
         self._u_template = u
@@ -794,6 +724,12 @@ class DeePCController:
         # Transform predictions back to physical coordinates.
         u_pred = u_pred + self.equilibrium_input
         y_pred = y_pred + self.target_output
+        # Round-off can leave the first input a hair outside the bounds it satisfies
+        # in the QP; clip it so that the simulator does not warn about it.
+        if self.env.input_lbs is not None:
+            u_pred = np.maximum(u_pred, np.asarray(self.env.input_lbs, dtype=float))
+        if self.env.input_ubs is not None:
+            u_pred = np.minimum(u_pred, np.asarray(self.env.input_ubs, dtype=float))
         u_optimal = u_pred[0].copy()
 
         # Store the output/input pair for the next receding-horizon update.
@@ -887,6 +823,7 @@ class ARXPredictiveController:
             freq: float,
             N: int,
             output_indices=(0,),
+            velocity_bounds: tuple = None,
             name: str = 'ARX-MPC',
             type: str = 'MPC',
             verbose: bool = False,
@@ -907,6 +844,7 @@ class ARXPredictiveController:
         self.N = int(N)
         self.name, self.type, self.verbose = name, type, verbose
         self.tolerance = float(tolerance)
+        self.velocity_bounds = velocity_bounds   # bounds on (y_{i+1} - y_i) / dt, see DeePCController
         self.output_indices = np.asarray(output_indices, dtype=int).reshape(-1)
         self.dim_inputs = dynamics.dim_inputs
         self.target_state = np.asarray(env.target_state, dtype=float)
@@ -959,14 +897,23 @@ class ARXPredictiveController:
         self._Qbar = np.diag(q_diag)
         H = Gamma.T @ self._Qbar @ Gamma + self.R[0, 0] * np.eye(N)
         self._P = sparse.csc_matrix(np.triu(2.0 * H))
-        # constraints: u bounds (identity rows) and y bounds (Gamma rows)
-        self._A = sparse.csc_matrix(np.vstack([np.eye(N), Gamma]))
+        # constraints: u bounds (identity rows), y bounds (Gamma rows) and, optionally,
+        # velocity bounds on the differences of [y_0, y_1, ..., y_N]
+        blocks = [np.eye(N), Gamma]
+        if self.velocity_bounds is not None:
+            D_full = (np.eye(N + 1, k=1) - np.eye(N + 1))[:-1] / self.dt      # (N, N+1)
+            self._d0v, self._Dv = D_full[:, 0], D_full[:, 1:]                 # y_0 column, y_1..y_N block
+            blocks.append(self._Dv @ Gamma)
+        self._A = sparse.csc_matrix(np.vstack(blocks))
         u_lb = -np.inf if self.env.input_lbs is None else float(np.broadcast_to(self.env.input_lbs, (1,))[0])
         u_ub = np.inf if self.env.input_ubs is None else float(np.broadcast_to(self.env.input_ubs, (1,))[0])
         y_lb = -np.inf if self.env.state_lbs is None else float(np.asarray(self.env.state_lbs)[self.output_indices][0])
         y_ub = np.inf if self.env.state_ubs is None else float(np.asarray(self.env.state_ubs)[self.output_indices][0])
         self._l = np.concatenate([np.full(N, u_lb - self.equilibrium_input), np.full(N, y_lb - self.target_output)])
         self._u = np.concatenate([np.full(N, u_ub - self.equilibrium_input), np.full(N, y_ub - self.target_output)])
+        if self.velocity_bounds is not None:
+            self._l = np.concatenate([self._l, np.full(N, float(self.velocity_bounds[0]))])
+            self._u = np.concatenate([self._u, np.full(N, float(self.velocity_bounds[1]))])
         self.solver = osqp.OSQP()
         self.solver.setup(P=self._P, q=np.zeros(N), A=self._A, l=self._l, u=self._u,
                           verbose=self.verbose, warm_start=True, polish=True,
@@ -1004,7 +951,10 @@ class ARXPredictiveController:
         q = 2.0 * (self.Gamma.T @ self._Qbar @ y_free)
         N = self.N
         l = self._l.copy(); u = self._u.copy()
-        l[N:] -= y_free; u[N:] -= y_free
+        l[N:2 * N] -= y_free; u[N:2 * N] -= y_free
+        if self.velocity_bounds is not None:
+            shift = self._d0v * y0 + self._Dv @ y_free
+            l[2 * N:] -= shift; u[2 * N:] -= shift
         self.solver.update(q=q, l=l, u=u)
         result = self.solver.solve()
         if result.info.status_val not in (1, 2):
