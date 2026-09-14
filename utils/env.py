@@ -456,10 +456,10 @@ class Dynamics:
         dsin_dz = 1 / (1 + mu_dh**2)**(3/2)
         dprod_dz = mu_cos * dsin_dz + mu_sin * dcos_dz
 
-        sigma_cos2 = (dcos_dz**2) * sigma_dh
-        sigma_sincos2 = (dprod_dz**2) * sigma_dh
-
-        sigma_v_cont = Gravity**2 * sigma_sincos2 + u**2 * sigma_cos2
+        # Both terms depend on the SAME random slope. Differentiate their sum
+        # before squaring to retain the covariance between propulsion and gravity.
+        daccel_dz = u * dcos_dz - Gravity * dprod_dz
+        sigma_v_cont = daccel_dz**2 * sigma_dh
         sigma_vec_cont = ca.vertcat(0, sigma_v_cont)
         Sigma_w_cont = ca.diag(sigma_vec_cont)
         Sigma_w_disc = dt**2 * Sigma_w_cont
@@ -845,4 +845,3 @@ class Env_rl_c(Env):
             reward = -1 # np.exp( - 1.0 * np.linalg.norm(next_pos-self.env.target_state[0]))
 
         return done, next_state, reward
-

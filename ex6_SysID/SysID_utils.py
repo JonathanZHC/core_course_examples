@@ -1,5 +1,6 @@
 import casadi as ca
 import numpy as np
+from scipy.linalg import cho_solve, solve_triangular
 import csv
 import matplotlib.pyplot as plt
 from IPython.display import HTML
@@ -297,7 +298,7 @@ class Identifier_BLR(Identifier_LR):
         - basis_functions: list of basis functions
         - sigma2: observation noise variance σ²
         - mu0: prior mean vector μ₀ (default: 0 vector)
-        - Sigma0: prior covariance matrix Σ₀ (default: λ² I)
+        - Sigma0: positive-definite prior covariance matrix Σ₀ (default: I)
         """
         super().__init__(basis_functions)
         self.sigma2 = sigma2
@@ -305,6 +306,19 @@ class Identifier_BLR(Identifier_LR):
         self.Sigma0_user = Sigma0
         self.mu_theta = None
         self.Sigma_theta = None
+
+    def _prior(self):
+        B = len(self.basis_functions)
+        mu0 = np.zeros((B, 1)) if self.mu0_user is None else np.asarray(self.mu0_user, dtype=float).reshape(-1, 1)
+        Sigma0 = np.eye(B) if self.Sigma0_user is None else np.asarray(self.Sigma0_user, dtype=float)
+        if B == 0 or mu0.shape != (B, 1) or Sigma0.shape != (B, B):
+            raise ValueError("The prior dimensions must match the number of basis functions.")
+        if not np.isfinite(self.sigma2) or self.sigma2 <= 0:
+            raise ValueError("sigma2 must be finite and positive.")
+        if not np.all(np.isfinite(mu0)) or not np.all(np.isfinite(Sigma0)) or not np.allclose(Sigma0, Sigma0.T):
+            raise ValueError("The prior must be finite and its covariance symmetric.")
+        np.linalg.cholesky(Sigma0)  # validate positive definiteness
+        return mu0, Sigma0
 
     def reset(self):
         super().reset()
@@ -317,14 +331,14 @@ class Identifier_BLR(Identifier_LR):
         h: np.ndarray
     ) -> None:
         
-        p = p.reshape(-1, 1)
-        h = h.reshape(-1, 1)
+        p = np.asarray(p, dtype=float).reshape(-1, 1)
+        h = np.asarray(h, dtype=float).reshape(-1, 1)
+        if len(p) != len(h) or not np.all(np.isfinite(p)) or not np.all(np.isfinite(h)):
+            raise ValueError("p and h must contain the same number of finite observations.")
         Phi = np.hstack([f(p) for f in self.basis_functions])  # N x B
-        B = Phi.shape[1]
 
         # Set prior mean and covariance
-        mu0 = self.mu0_user if self.mu0_user is not None else np.zeros((B, 1))
-        Sigma0 = self.Sigma0_user if self.Sigma0_user is not None else np.eye(B)
+        mu0, Sigma0 = self._prior()
 
         # Compute posterior
         Sigma0_inv = np.linalg.inv(Sigma0)
@@ -337,16 +351,35 @@ class Identifier_BLR(Identifier_LR):
 
     def predict(
         self, 
-        p: np.ndarray
+        p: np.ndarray,
+        include_noise: bool = True
     ) -> tuple:
-        
-        p = p.reshape(-1, 1)
+        """Return mean and std of a new observation, or the latent function if requested."""
+        if self.mu_theta is None:
+            raise ValueError("Fit the BLR before predicting.")
+        p = np.asarray(p, dtype=float).reshape(-1, 1)
         Phi_test = np.hstack([f(p) for f in self.basis_functions])  # N x B
 
         mean = Phi_test @ self.mu_theta
-        var = np.sum(Phi_test @ self.Sigma_theta * Phi_test, axis=1, keepdims=True) + self.sigma2
+        var = np.maximum(np.sum(Phi_test @ self.Sigma_theta * Phi_test, axis=1, keepdims=True), 0.0)
+        if include_noise:
+            var += self.sigma2
         std = np.sqrt(var)
         return mean, std
+
+    def log_marginal_likelihood(self, p, h) -> float:
+        """Log density of the observations, integrating out the coefficient prior."""
+        p = np.asarray(p, dtype=float).reshape(-1, 1)
+        h = np.asarray(h, dtype=float).reshape(-1, 1)
+        if len(p) != len(h):
+            raise ValueError("p and h must contain the same number of observations.")
+        mu0, Sigma0 = self._prior()
+        Phi = np.hstack([f(p) for f in self.basis_functions])
+        L = np.linalg.cholesky(Phi @ Sigma0 @ Phi.T + self.sigma2 * np.eye(len(p)))
+        residual = h - Phi @ mu0
+        whitened = solve_triangular(L, residual, lower=True)
+        return float(-0.5 * np.sum(whitened**2) - np.log(np.diag(L)).sum()
+                     - 0.5 * len(p) * np.log(2 * np.pi))
 
     def plot(
         self, 
@@ -668,8 +701,8 @@ class Identifier_GP:
         k(p, p') = sigma_f^2 * exp( -(p - p')^2 / (2 l^2) ),
 
     used as the black-box counterpart to Identifier_BLR. It assumes only that the
-    terrain is smooth, so all of its structural knowledge sits in the two
-    hyperparameters l (lengthscale) and sigma_f (signal standard deviation).
+    terrain is a scalar function with a zero-mean, stationary RBF prior. The kernel
+    family encodes smoothness; l and sigma_f set its length and amplitude scales.
     """
 
     def __init__(
@@ -684,6 +717,23 @@ class Identifier_GP:
         self.noise_std = noise_std
         self.p_train = None
         self.h_train = None
+        self._fit_hyperparameters = None
+        self.jitter = 1e-12  # numerical regularization, not observation noise
+
+    def reset(self):
+        self.p_train = self.h_train = None
+        self._fit_hyperparameters = None
+
+    def _validate_hyperparameters(self):
+        values = (self.lengthscale, self.signal_std, self.noise_std)
+        if not np.all(np.isfinite(values)) or self.lengthscale <= 0 or self.signal_std <= 0 or self.noise_std < 0:
+            raise ValueError("lengthscale and signal_std must be positive; noise_std must be nonnegative.")
+
+    def _check_fitted(self):
+        if self.p_train is None:
+            raise ValueError("Fit the GP before predicting or exporting it.")
+        if self._fit_hyperparameters != (self.lengthscale, self.signal_std, self.noise_std, self.jitter):
+            raise ValueError("GP hyperparameters changed after fitting; call fit again.")
 
     def _kernel(self, pa, pb):
         d = np.asarray(pa).reshape(-1, 1) - np.asarray(pb).reshape(1, -1)
@@ -691,16 +741,22 @@ class Identifier_GP:
 
     def log_marginal_likelihood(self, p, h) -> float:
         """Evidence of the data under the current hyperparameters."""
+        self._validate_hyperparameters()
         p, h = np.asarray(p).ravel(), np.asarray(h).ravel()
-        K = self._kernel(p, p) + (self.noise_std**2 + 1e-12) * np.eye(len(p))
+        if len(p) != len(h) or not np.all(np.isfinite(p)) or not np.all(np.isfinite(h)):
+            raise ValueError("p and h must contain the same number of finite observations.")
+        K = self._kernel(p, p) + (self.noise_std**2 + self.jitter) * np.eye(len(p))
         L = np.linalg.cholesky(K)
-        alpha = np.linalg.solve(L.T, np.linalg.solve(L, h))
+        alpha = cho_solve((L, True), h)
         return float(-0.5 * h @ alpha - np.sum(np.log(np.diag(L))) - 0.5 * len(p) * np.log(2 * np.pi))
 
     def optimize_hyperparameters(self, p, h, lengthscales=None, signal_stds=None):
         """Grid search on the log marginal likelihood."""
         lengthscales = np.logspace(-2, np.log10(2.0), 50) if lengthscales is None else lengthscales
         signal_stds = np.logspace(np.log10(5e-4), -1, 40) if signal_stds is None else signal_stds
+        if len(lengthscales) == 0 or len(signal_stds) == 0:
+            raise ValueError("Hyperparameter grids must not be empty.")
+        self.reset()  # cached posterior factors belong to the old hyperparameters
         best_lml, best_hp = -np.inf, (self.lengthscale, self.signal_std)
         for l in lengthscales:
             for s in signal_stds:
@@ -712,23 +768,29 @@ class Identifier_GP:
         return best_hp, best_lml
 
     def fit(self, p, h) -> None:
+        self._validate_hyperparameters()
         self.p_train = np.asarray(p).reshape(-1, 1)
         self.h_train = np.asarray(h).reshape(-1, 1)
+        if len(self.p_train) != len(self.h_train) or not np.all(np.isfinite(self.p_train)) or not np.all(np.isfinite(self.h_train)):
+            self.reset()
+            raise ValueError("p and h must contain the same number of finite observations.")
         p_flat = self.p_train.ravel()
-        K = self._kernel(p_flat, p_flat) + (self.noise_std**2 + 1e-12) * np.eye(len(p_flat))
+        K = self._kernel(p_flat, p_flat) + (self.noise_std**2 + self.jitter) * np.eye(len(p_flat))
         self.L = np.linalg.cholesky(K)
-        self.alpha = np.linalg.solve(self.L.T, np.linalg.solve(self.L, self.h_train.ravel()))
-        self.K_inv = np.linalg.inv(K)
+        self.alpha = cho_solve((self.L, True), self.h_train.ravel())
+        self.K_inv = cho_solve((self.L, True), np.eye(len(p_flat)))
+        self._fit_hyperparameters = (self.lengthscale, self.signal_std, self.noise_std, self.jitter)
 
     def predict(self, p, include_noise: bool = True) -> tuple:
+        self._check_fitted()
         p = np.asarray(p).reshape(-1, 1)
         Ks = self._kernel(p.ravel(), self.p_train.ravel())
         mean = (Ks @ self.alpha).reshape(-1, 1)
-        v = np.linalg.solve(self.L, Ks.T)
-        var = self.signal_std**2 - np.sum(v**2, axis=0).reshape(-1, 1)
+        v = solve_triangular(self.L, Ks.T, lower=True)
+        var = np.maximum(self.signal_std**2 - np.sum(v**2, axis=0).reshape(-1, 1), 0.0)
         if include_noise:
             var = var + self.noise_std**2
-        return mean, np.sqrt(np.maximum(var, 1e-18))
+        return mean, np.sqrt(var)
 
     def plot(self, p_test=None, true_func=None, title='Gaussian Process', ax=None) -> None:
         if self.p_train is None:
@@ -750,28 +812,29 @@ class Identifier_GP:
         ax.set_xlabel('p'); ax.set_ylabel('h(p)'); ax.grid(True); ax.legend()
 
 
-def construct_gp_casadi_expression(model: Identifier_GP) -> tuple:
+def construct_gp_casadi_expression(model: Identifier_GP, include_noise: bool = True) -> tuple:
     """
     Turn a fitted Identifier_GP into CasADi functions usable inside an MPC.
 
     Returns (h_func, sigma2_h, sigma2_dh), where
 
     - h_func(p)    = k_*(p)^T (K + sigma_n^2 I)^{-1} y            posterior mean
-    - sigma2_h(p)  = k(p,p) - k_*(p)^T K_inv k_*(p) + sigma_n^2   posterior variance of h
+    - sigma2_h(p)  = k(p,p) - k_*(p)^T K_inv k_*(p) + sigma_n^2   observation variance
     - sigma2_dh(p) = Var[h'(p)]                                   posterior variance of the slope
 
     The slope variance is the second mixed derivative of the posterior covariance,
     d^2/dp dp' [ k(p,p') - k_*(p)^T K_inv k_*(p') ] at p' = p. For the squared-
     exponential kernel the first term evaluates to sigma_f^2 / l^2, and the second
     is obtained by differentiating k_*. It is *not* the derivative of sigma2_h.
+    Measurement noise is included in sigma2_h by default, matching predict(). Set
+    include_noise=False for latent height variance. Slope variance is always latent.
     """
-    if model.p_train is None:
-        raise ValueError("The GP must be fitted before it can be converted to CasADi.")
+    model._check_fitted()
 
     p_sym = ca.MX.sym("p")
     P = ca.DM(model.p_train.reshape(-1, 1))
     l, sf, sn = model.lengthscale, model.signal_std, model.noise_std
-    K_inv = ca.DM(model.K_inv)
+    L_inv = ca.DM(solve_triangular(model.L, np.eye(len(model.p_train)), lower=True))
 
     # k_*(p): kernel between the test point and every training input
     ks = sf**2 * ca.exp(-0.5 * ((p_sym - P) / l)**2)
@@ -779,11 +842,13 @@ def construct_gp_casadi_expression(model: Identifier_GP) -> tuple:
     h_expr = ca.dot(ks, ca.DM(model.alpha.reshape(-1, 1)))
     h_func = ca.Function("h_gp", [p_sym], [h_expr])
 
-    var_expr = sf**2 - ca.mtimes([ks.T, K_inv, ks]) + sn**2
+    var_expr = ca.fmax(sf**2 - ca.sumsqr(L_inv @ ks), 0)
+    if include_noise:
+        var_expr += sn**2
     sigma2_h = ca.Function("sigma2_h_gp", [p_sym], [var_expr])
 
     dks = ca.jacobian(ks, p_sym)
-    dvar_expr = sf**2 / l**2 - ca.mtimes([dks.T, K_inv, dks])
+    dvar_expr = ca.fmax(sf**2 / l**2 - ca.sumsqr(L_inv @ dks), 0)
     sigma2_dh = ca.Function("sigma2_dh_gp", [p_sym], [dvar_expr])
 
     return h_func, sigma2_h, sigma2_dh

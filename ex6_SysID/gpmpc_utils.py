@@ -18,8 +18,10 @@ class GPMPCController(LQRController):
          where A_i is the discrete-time Jacobian of the learned dynamics, and
       3. tightens the state constraints by beta standard deviations,
              lb + beta*sqrt(diag(Sigma_i))  <=  x_i  <=  ub - beta*sqrt(diag(Sigma_i)),
-         which is the deterministic reformulation of a chance constraint under a
-         Gaussian assumption (beta = 2 corresponds to roughly 95% per constraint).
+         an approximate marginal Gaussian tightening (beta = 2 gives 95.45% for
+         a scalar two-sided interval before capping or softening). This is not a
+         joint trajectory guarantee: temporal model-error correlation is ignored
+         and the ancillary gain is used only in the covariance approximation.
 
     Setting beta = 0 recovers a certainty-equivalent MPC that uses the learned mean
     and ignores its uncertainty.
@@ -158,6 +160,7 @@ class GPMPCController(LQRController):
         self.Sigma_x_log.append(np.array([np.diag(S) for S in Sigma_seq]))
 
         ref = np.concatenate((self.env.target_state, np.zeros(self.dim_inputs)))
+        self.solver.set(0, "yref", ref)
         for i in range(1, self.N):
             self.solver.set(i, "yref", ref)
             lb, ub = self.tighten_state_constraints(Sigma_seq[i])
@@ -166,7 +169,9 @@ class GPMPCController(LQRController):
         lb, ub = self.tighten_state_constraints(Sigma_seq[self.N])
         self.solver.set(self.N, "lbx", lb); self.solver.set(self.N, "ubx", ub)
 
-        self.solver.solve()
+        status = self.solver.solve()
+        if status != 0:
+            raise RuntimeError(f"{self.name}: acados solve failed with status {status} at step {current_time}.")
         u_opt = self.solver.get(0, "u")
         x_pred = np.array([self.solver.get(i, "x") for i in range(self.N + 1)])
         u_pred = np.array([self.solver.get(i, "u") for i in range(self.N)])
