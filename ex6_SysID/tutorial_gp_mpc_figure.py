@@ -31,16 +31,21 @@ DATA_DIR = os.path.join(FIG_DIR, "gp_mpc_redesign_data")
 
 # --------------------------------------------------------------------------------------
 # Cases. Q and R are the MPC weights (Q_f = Q, as in the notebook); `ancillary=False`
-# propagates the covariance open loop (K = 0); `overlay` draws another case's plan in gray.
+# propagates the covariance open loop (K = 0); `overlay` draws another case's plan in gray;
+# `extra_curve` adds another case's beta sweep to the trade-off panel in faint green;
+# `extra_data` gives the GP additional measurements on top of the chapter's 150.
 # --------------------------------------------------------------------------------------
 CASES = {
     "baseline":        dict(Q=(5.0, 5.0), R=0.1,  ancillary=True,  cost_ylim=None,      output="tutorial_gp_mpc_redesign"),
     "Q50":             dict(Q=(5.0, 0.0), R=0.1,  ancillary=True,  cost_ylim=(35, 105), output="tutorial_gp_mpc_redesign_Q50"),
-    "Q50R0":           dict(Q=(5.0, 0.0), R=1e-6, ancillary=True,  cost_ylim=(30, 70),  output="tutorial_gp_mpc_redesign_Q50R0"),
-    "Q50R001":         dict(Q=(5.0, 0.0), R=0.01, ancillary=True,  cost_ylim=(30, 70),  output="tutorial_gp_mpc_redesign_Q50R001"),
-    "Q50R001_noK":     dict(Q=(5.0, 0.0), R=0.01, ancillary=False, cost_ylim=(30, 70),  output="tutorial_gp_mpc_redesign_Q50R001_noK"),
-    "Q50R001_overlay": dict(Q=(5.0, 0.0), R=0.01, ancillary=True,  cost_ylim=(30, 70),  output="tutorial_gp_mpc_redesign_Q50R001_overlay",
-                            data_from="Q50R001", overlay="Q50R001_noK"),
+    "Q50R0":           dict(Q=(5.0, 0.0), R=1e-6, ancillary=True,  cost_ylim=(26, 70),  output="tutorial_gp_mpc_redesign_Q50R0"),
+    "Q50R001":         dict(Q=(5.0, 0.0), R=0.01, ancillary=True,  cost_ylim=(26, 70),  output="tutorial_gp_mpc_redesign_Q50R001"),
+    "Q50R001_noK":     dict(Q=(5.0, 0.0), R=0.01, ancillary=False, cost_ylim=(26, 70),  output="tutorial_gp_mpc_redesign_Q50R001_noK"),
+    "Q50R001_overlay": dict(Q=(5.0, 0.0), R=0.01, ancillary=True,  cost_ylim=(26, 70),  output="tutorial_gp_mpc_redesign_Q50R001_overlay",
+                            data_from="Q50R001", overlay="Q50R001_noK", extra_curve="Q50R001_more"),
+    # additional learning: the GP also sees 50 measurements collected inside the gap
+    "Q50R001_more":    dict(Q=(5.0, 0.0), R=0.01, ancillary=True,  cost_ylim=(26, 70),  output="tutorial_gp_mpc_redesign_Q50R001_more",
+                            extra_data=dict(p_range=[(-0.5, 0.5)], num_samples=50)),
 }
 
 # Experiment constants, identical to the notebook's setup cell
@@ -78,6 +83,11 @@ def simulate_case(name):
     data_gen.set_noise(mean=0.0, std=SIGMA_MEAS)
     p_train, h_train = data_gen.generate_data()
     true_func = data_gen.get_symbolic_function()
+    if "extra_data" in cfg:   # additional learning: more measurements, drawn after the chapter's 150
+        extra = GenerateData(p_range=cfg["extra_data"]["p_range"], num_samples=cfg["extra_data"]["num_samples"], case=CASE_REAL, param=TERRAIN_PARAM)
+        extra.set_noise(mean=0.0, std=SIGMA_MEAS)
+        p_extra, h_extra = extra.generate_data()
+        p_train, h_train = np.vstack([p_train, p_extra]), np.vstack([h_train, h_extra])
 
     gp = Identifier_GP(noise_std=SIGMA_MEAS)
     (l_opt, sf_opt), _ = gp.optimize_hyperparameters(p_train, h_train)
@@ -321,8 +331,14 @@ def cost_formula(cfg):
     return rf"$J=\Sigma_k {state}+{r_txt}u_k^2$"
 
 
-def panel_tradeoff(ax, D, cfg):
+def panel_tradeoff(ax, D, cfg, D_extra=None):
     from matplotlib.ticker import MaxNLocator
+    if D_extra is not None:   # the same sweep for a GP trained with additional data, in faint green
+        v2 = [float(D_extra[f"b{b}_violation"]) for b in BETAS]
+        J2 = [float(D_extra[f"b{b}_cost"]) for b in BETAS]
+        ax.plot(v2, J2, "-o", color="#8fbc8f", lw=0.8, ms=3, zorder=1)
+        ax.annotate("GP with data\nin the gap", (v2[0], J2[0]), textcoords="offset points", xytext=(8, -3), ha="left", va="top",
+                    fontsize=5.5, color="#5f9f5f", linespacing=1.0)
     viol = [float(D[f"b{b}_violation"]) for b in BETAS]
     cost = [float(D[f"b{b}_cost"]) for b in BETAS]
     ax.plot(viol, cost, "-", color="0.6", lw=0.8, zorder=1)
@@ -351,6 +367,7 @@ def make_figure(name, rerun=False):
     cfg = CASES[name]
     D = load_case(cfg.get("data_from", name), rerun)
     D_overlay = load_case(cfg["overlay"], rerun) if "overlay" in cfg else None
+    D_extra = load_case(cfg["extra_curve"], rerun) if "extra_curve" in cfg else None
     with plt.rc_context(PAPER_RC):
         fig = plt.figure(figsize=(3.5, 3.8))
         outer = fig.add_gridspec(2, 1, height_ratios=[1.45, 1.2], hspace=0.42)
@@ -361,7 +378,7 @@ def make_figure(name, rerun=False):
         panel_profile(ax_prof, D)
         bot = outer[1].subgridspec(1, 2, width_ratios=[1.5, 1.0], wspace=0.6)
         panel_statespace(fig.add_subplot(bot[0]), D, D_overlay)
-        panel_tradeoff(fig.add_subplot(bot[1]), D, cfg)
+        panel_tradeoff(fig.add_subplot(bot[1]), D, cfg, D_extra)
         os.makedirs(FIG_DIR, exist_ok=True)
         for ext in ("png", "pdf"):
             fig.savefig(os.path.join(FIG_DIR, f"{cfg['output']}.{ext}"), dpi=300, bbox_inches="tight")
