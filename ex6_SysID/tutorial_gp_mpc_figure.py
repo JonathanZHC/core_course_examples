@@ -33,7 +33,8 @@ DATA_DIR = os.path.join(FIG_DIR, "gp_mpc_redesign_data")
 # Cases. Q and R are the MPC weights (Q_f = Q, as in the notebook); `ancillary=False`
 # propagates the covariance open loop (K = 0); `overlay` draws another case's plan in gray;
 # `extra_curve` adds another case's beta sweep to the trade-off panel in faint green;
-# `extra_data` gives the GP additional measurements on top of the chapter's 150.
+# `extra_data` gives the GP additional measurements on top of the chapter's 150; `extra_profile`
+# adds a second zoom strip with that case's learned terrain and its extra data points.
 # --------------------------------------------------------------------------------------
 CASES = {
     "baseline":        dict(Q=(5.0, 5.0), R=0.1,  ancillary=True,  cost_ylim=None,      output="tutorial_gp_mpc_redesign"),
@@ -43,6 +44,9 @@ CASES = {
     "Q50R001_noK":     dict(Q=(5.0, 0.0), R=0.01, ancillary=False, cost_ylim=(26, 70),  output="tutorial_gp_mpc_redesign_Q50R001_noK"),
     "Q50R001_overlay": dict(Q=(5.0, 0.0), R=0.01, ancillary=True,  cost_ylim=(26, 70),  output="tutorial_gp_mpc_redesign_Q50R001_overlay",
                             data_from="Q50R001", overlay="Q50R001_noK", extra_curve="Q50R001_more"),
+    # as the overlay figure, plus a strip showing the GP retrained with the additional data in the gap
+    "Q50R001_overlay_more": dict(Q=(5.0, 0.0), R=0.01, ancillary=True, cost_ylim=(26, 70), output="tutorial_gp_mpc_redesign_Q50R001_overlay_more",
+                                 data_from="Q50R001", overlay="Q50R001_noK", extra_curve="Q50R001_more", extra_profile="Q50R001_more"),
     # additional learning: the GP also sees 50 measurements collected inside the gap
     "Q50R001_more":    dict(Q=(5.0, 0.0), R=0.01, ancillary=True,  cost_ylim=(26, 70),  output="tutorial_gp_mpc_redesign_Q50R001_more",
                             extra_data=dict(p_range=[(-0.5, 0.5)], num_samples=50)),
@@ -257,24 +261,32 @@ def panel_scene(ax, D):
     ax.set_title("Problem Setup", pad=3)
 
 
-def panel_profile(ax, D):
-    """Strip under the scene, sharing its x-axis: terrain with ~10x vertical zoom and the learned GP."""
+def panel_profile(ax, D, color=C_MAIN, label=r"learned $\hat h(p)\pm2\sigma_h$", guides=True, extra_points=False, xlabel=True):
+    """Strip under the scene, sharing its x-axis: terrain with ~10x vertical zoom and a learned GP.
+    With extra_points=True the training points inside the gap are drawn (the additional-learning case)."""
     gap = D["gap"]
     ax.set_xlim(-0.9, 0.9)
     ax.set_ylim(-0.031, 0.031)
     ax.set_autoscale_on(False)
     ax.axvspan(gap[0], gap[1], color="0.93", zorder=0, lw=0)
-    ax.fill_between(D["p_grid"], D["gp_mean"] - 2 * D["gp_std"], D["gp_mean"] + 2 * D["gp_std"], color=C_MAIN, alpha=0.18, lw=0, zorder=1)
-    ax.plot(D["p_grid"], D["gp_mean"], "--", color=C_MAIN, lw=0.8, zorder=2)
+    ax.fill_between(D["p_grid"], D["gp_mean"] - 2 * D["gp_std"], D["gp_mean"] + 2 * D["gp_std"], color=color, alpha=0.18, lw=0, zorder=1)
+    ax.plot(D["p_grid"], D["gp_mean"], "--", color=color, lw=0.8, zorder=2)
     ax.plot(D["p_grid"], D["h_true"], "-", color="k", lw=0.9, zorder=3)
+    if extra_points:
+        m = np.abs(D["p_train"]) < gap[1]
+        ax.plot(D["p_train"][m], D["h_train"][m], ".", color=color, ms=2.2, zorder=5)
     ax.text(-0.87, 0.020, "terrain $h(p)$", fontsize=5.5, ha="left", va="center")
-    ax.text(0.0, 0.024, r"learned $\hat h(p)\pm2\sigma_h$", fontsize=5.5, ha="center", va="center", color=C_MAIN)
-    for p in (D["b2_states"][0, 0], D["b2_pred"][0][-1, 0]):
-        ax.axvline(p, color="0.5", lw=0.5, ls=":", zorder=4)
+    ax.text(0.0, 0.024, label, fontsize=5.5, ha="center", va="center", color=color)
+    if guides:
+        for p in (D["b2_states"][0, 0], D["b2_pred"][0][-1, 0]):
+            ax.axvline(p, color="0.5", lw=0.5, ls=":", zorder=4)
     ax.set_xticks([-0.5, 0, 0.5])
     ax.set_yticks([-0.02, 0, 0.02])
-    ax.set_xlabel("position $p$", labelpad=1)
     ax.set_ylabel(r"$h$ (zoom)")
+    if xlabel:
+        ax.set_xlabel("position $p$", labelpad=1)
+    else:
+        ax.tick_params(axis="x", labelbottom=False)
 
 
 def draw_plan_ellipses(ax, mu, S, beta, **style):
@@ -380,14 +392,24 @@ def make_figure(name, rerun=False):
     D = load_case(cfg.get("data_from", name), rerun)
     D_overlay = load_case(cfg["overlay"], rerun) if "overlay" in cfg else None
     D_extra = load_case(cfg["extra_curve"], rerun) if "extra_curve" in cfg else None
+    D_prof = load_case(cfg["extra_profile"], rerun) if "extra_profile" in cfg else None
     with plt.rc_context(PAPER_RC):
-        fig = plt.figure(figsize=(3.5, 3.8))
-        outer = fig.add_gridspec(2, 1, height_ratios=[1.45, 1.2], hspace=0.42)
-        top = outer[0].subgridspec(2, 1, height_ratios=[1.0, 0.55], hspace=0.12)
+        if D_prof is None:
+            fig = plt.figure(figsize=(3.5, 3.8))
+            outer = fig.add_gridspec(2, 1, height_ratios=[1.45, 1.2], hspace=0.42)
+            top = outer[0].subgridspec(2, 1, height_ratios=[1.0, 0.55], hspace=0.12)
+        else:
+            fig = plt.figure(figsize=(3.5, 4.3))
+            outer = fig.add_gridspec(2, 1, height_ratios=[1.95, 1.2], hspace=0.36)
+            top = outer[0].subgridspec(3, 1, height_ratios=[1.0, 0.55, 0.55], hspace=0.12)
         ax_scene = fig.add_subplot(top[0])
         ax_prof = fig.add_subplot(top[1], sharex=ax_scene)
         panel_scene(ax_scene, D)
-        panel_profile(ax_prof, D)
+        panel_profile(ax_prof, D, xlabel=D_prof is None)
+        if D_prof is not None:
+            ax_prof2 = fig.add_subplot(top[2], sharex=ax_scene)
+            panel_profile(ax_prof2, D_prof, color="#3f8f3f", label=r"learned $\hat h(p)\pm2\sigma_h$ with data in the gap",
+                          guides=False, extra_points=True)
         bot = outer[1].subgridspec(1, 2, width_ratios=[1.5, 1.0], wspace=0.6)
         panel_statespace(fig.add_subplot(bot[0]), D, D_overlay)
         panel_tradeoff(fig.add_subplot(bot[1]), D, cfg, D_extra)
