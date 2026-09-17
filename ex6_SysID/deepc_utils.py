@@ -541,11 +541,26 @@ class DeePCController:
         self.Yp = Hy[:self.T_ini * ny]
         self.Yf = Hy[self.T_ini * ny:]
 
-        # A simple PE/rank check for the offline input data.
+        # Two rank conditions on the offline data, both reported for the notebooks.
+        #
+        # (a) Persistency of excitation of order T_ini + N + n_x (Willems et al., 2005):
+        #     rank H_{T_ini+N+n_x}(u^d) = n_u (T_ini + N + n_x), i.e. full row rank. A condition
+        #     on the input alone, sufficient for the Hankel columns to span the behaviour.
         pe_order = self.T_ini + self.N + self.dim_states
         H_pe = _block_hankel(u_dev, pe_order)
         pe_rank = np.linalg.matrix_rank(H_pe)
         self.pe_rank, self.pe_required_rank = int(pe_rank), int(H_pe.shape[0])
+        self.pe_columns = int(H_pe.shape[1])
+
+        # (b) Generalized persistency of excitation (Markovsky and Doerfler, 2023):
+        #     rank [H_{T_ini+N}(u^d); H_{T_ini+N}(y^d)] = n_u (T_ini + N) + n_x. A condition on the
+        #     measured input-output data, necessary AND sufficient for the same span. Every column
+        #     of the stacked Hankel is a trajectory of the system, so the rank can never exceed
+        #     this value; it only has to reach it.
+        H_gpe = np.vstack([self.Up, self.Uf, self.Yp, self.Yf])
+        self.gpe_rank = int(np.linalg.matrix_rank(H_gpe))
+        self.gpe_required_rank = int(nu * (self.T_ini + self.N) + self.dim_states)
+        self.gpe_columns = int(H_gpe.shape[1])
         if pe_rank < H_pe.shape[0] and self.enforce_pe_check:
             raise ValueError(
                 f"Offline input is not persistently exciting enough: "
