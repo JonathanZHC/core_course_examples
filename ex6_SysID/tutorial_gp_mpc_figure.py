@@ -5,7 +5,7 @@ beta = 0, 1, 2, 3 plus the true-model reference) for its own cost weights and co
 propagation, caches the closed-loop results, and draws the two-row figure:
 
     Problem Setup (true-scale scene + zoomed terrain/GP strip)
-    Plan at t = 0 in the state space  |  Performance vs. Safety
+    Plan at t = 0 in the state space  |  Cost vs. Safety
 
 Usage, from the repository root with the course Python environment (acados required):
 
@@ -331,32 +331,44 @@ def cost_formula(cfg):
     return rf"$J=\Sigma_k {state}+{r_txt}u_k^2$"
 
 
+def violation_pct(D):
+    """Percentage of closed-loop time steps at which |v| exceeds v_max, per beta. All runs of a case
+    must have the same number of steps for the percentages to be comparable."""
+    v_max = float(D["v_max"])
+    n_steps = {len(D[f"b{b}_states"]) for b in BETAS}
+    if len(n_steps) != 1:
+        raise ValueError(f"runs have different lengths: {sorted(n_steps)} states")
+    n = n_steps.pop()
+    return [100.0 * np.sum(np.abs(D[f"b{b}_states"][:, 1]) > v_max + 1e-6) / n for b in BETAS]
+
+
 def panel_tradeoff(ax, D, cfg, D_extra=None):
     from matplotlib.ticker import MaxNLocator
     if D_extra is not None:   # the same sweep for a GP trained with additional data, in faint green
-        v2 = [float(D_extra[f"b{b}_violation"]) for b in BETAS]
-        J2 = [float(D_extra[f"b{b}_cost"]) for b in BETAS]
+        v2, J2 = violation_pct(D_extra), [float(D_extra[f"b{b}_cost"]) for b in BETAS]
         ax.plot(v2, J2, "-o", color="#8fbc8f", lw=0.8, ms=3, zorder=1)
-        ax.annotate("GP with data\nin the gap", (v2[0], J2[0]), textcoords="offset points", xytext=(8, -3), ha="left", va="top",
-                    fontsize=5.5, color="#5f9f5f", linespacing=1.0)
-    viol = [float(D[f"b{b}_violation"]) for b in BETAS]
-    cost = [float(D[f"b{b}_cost"]) for b in BETAS]
+        ax.annotate("GP with data\nin the gap", (0.5 * (v2[0] + v2[1]), 0.5 * (J2[0] + J2[1])), textcoords="offset points",
+                    xytext=(0, -5), ha="center", va="top", fontsize=5.5, color="#5f9f5f", linespacing=1.0)
+    viol, cost = violation_pct(D), [float(D[f"b{b}_cost"]) for b in BETAS]
     ax.plot(viol, cost, "-", color="0.6", lw=0.8, zorder=1)
     for b, c, v, J in zip(BETAS, RAMP, viol, cost):
         ax.plot(v, J, "o", color=c, ms=4, zorder=2)
-        ax.annotate(rf"$\beta={b}$", (v, J), textcoords="offset points", xytext=(4, 3), ha="left", fontsize=6, color=c)
+        # if a slightly costlier point sits at the same x-position, put this label below instead of above
+        below = any(abs(v - v_o) < 0.2 and 0 < J_o - J < 0.2 * (max(cost) - min(cost)) for v_o, J_o in zip(viol, cost))
+        ax.annotate(rf"$\beta={b}$", (v, J), textcoords="offset points", xytext=(4, -3) if below else (4, 3),
+                    ha="left", va="top" if below else "baseline", fontsize=6, color=c)
     ax.axvline(0.0, color="k", ls=":", lw=0.7)
-    ax.set_xlim(-0.03, 0.225)
+    ax.set_xlim(-1.2, 10.8)
     if cfg["cost_ylim"] is None:
         span = max(cost) - min(cost)
         ax.set_ylim(min(cost) - 0.08 * span - 2, max(cost) + 0.2 * span + 3)
     else:
         ax.set_ylim(*cfg["cost_ylim"])
-    ax.set_xticks([0, 0.1, 0.2])
+    ax.set_xticks([0, 5, 10])
     ax.yaxis.set_major_locator(MaxNLocator(4, integer=True))
-    ax.set_xlabel("constraint violation\n" + r"$\max(|v| - v_{\max}, 0)$", labelpad=1)
+    ax.set_xlabel("constraint violation\n" + r"steps with $|v_k| > v_{\max}$ [%]", labelpad=1)
     ax.set_ylabel("closed-loop cost\n" + cost_formula(cfg), fontsize=6, labelpad=3)
-    ax.set_title("Performance vs. Safety", pad=3)
+    ax.set_title("Cost vs. Safety", pad=3)
     ax.grid(True, linewidth=0.4, alpha=0.5)
 
 
