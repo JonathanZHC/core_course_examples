@@ -1,7 +1,7 @@
 % Renders the stability/safety figure of Section III in several versions (one per page):
 %   v0: the figure as in safe_control.tex
 %   v1: revised HJ-reachability panel (d), tilted CBF set in (e), dashed maximal safe set in (e) and (f)
-%   v2: as v1, but the unsafe region is shaded red and labelled in (d)-(f) with a dashed edge, and the maximal safe set in (d) is strictly inside the constraints
+%   v2: as v1, but the unsafe region is shaded red and labelled in (d)-(f) with a solid gray edge, and the maximal safe set in (d) is strictly inside the constraints
 % Compile all versions:  latexmk -pdf main.tex   (or pdflatex main.tex twice)
 % Single-version PDFs:   pdflatex -jobname=safety_v1 "\def\variant{v1}\input{main.tex}"
 %                        pdflatex -jobname=safety_v2 "\def\variant{v2}\input{main.tex}"
