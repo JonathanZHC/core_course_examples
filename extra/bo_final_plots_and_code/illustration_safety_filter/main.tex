@@ -1,0 +1,29 @@
+% Renders the stability/safety figure of Section III in two versions:
+%   Version 1 (page 1): revised HJ-reachability panel (d), tilted CBF set in (e), dashed maximal safe set in (e) and (f)
+%   Version 2 (page 2): the figure as in safe_control.tex
+% Compile with:  latexmk -pdf main.tex   (or pdflatex main.tex twice)
+% Single-version PDFs:  pdflatex -jobname=safety_v1 "\def\variant{v1}\input{main.tex}"
+%                       pdflatex -jobname=safety_v2 "\def\variant{v2}\input{main.tex}"
+\IfFileExists{IEEEtran.cls}{\documentclass[conference]{IEEEtran}}{\documentclass{article}\usepackage[margin=0.75in]{geometry}}
+\usepackage{amsmath,amssymb}
+\usepackage{tikz}
+\usepackage{subcaption}
+\usepackage{xcolor}
+\usepackage[hidelinks]{hyperref}
+\providecommand{\edits}[1]{#1}       % the paper marks edited text; plain here
+\providecommand{\variant}{both}
+\begin{document}
+\makeatletter
+\def\@tmp{v1}\ifx\variant\@tmp
+	\input{fig_safety_v1.tex}
+\else
+\def\@tmp{v2}\ifx\variant\@tmp
+	\input{fig_safety_v2.tex}
+\else
+	% the page labels are set inside the figure files (guarded by \ifdefined\variantname)
+	\def\variantname{Version 1}\input{fig_safety_v1.tex}
+	\clearpage
+	\def\variantname{Version 2}\input{fig_safety_v2.tex}
+\fi\fi
+\makeatother
+\end{document}
