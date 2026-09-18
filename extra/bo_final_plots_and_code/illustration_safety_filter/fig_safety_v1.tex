@@ -72,7 +72,6 @@
 				\draw[blue!70!black, thin] plot[variable=\t, domain=0:1.1, samples=30] ({-1.7+2.2*(1.1-\t)*(1.1-\t)},{-1.1+\t});
 			\end{scope}
 			\draw[thick, rounded corners=6pt] (-1.7,-1.1) rectangle (1.7,1.1);
-			\node[font=\scriptsize, red!70!black, above right, inner sep=2pt] at (-1.7,-1.1) {$g(x,u)\le 0$};
 			\node[font=\scriptsize, blue!70!black] at (-0.6,0.55) {$\mathcal S$};
 			\node[font=\scriptsize, red!70!black] at (-1.3,-0.74) {unsafe};
 			\node[font=\scriptsize] at (0,-1.4) {maximal safe set};
@@ -90,8 +89,14 @@
 	\begin{subfigure}[b]{0.32\textwidth}
 		\centering
 		\begin{tikzpicture}[scale=1.25, >=stealth]
+			% the unsafe states of (d), shaded as in (d)
+			\begin{scope}
+				\clip[rounded corners=6pt] (-1.7,-1.1) rectangle (1.7,1.1);
+				\fill[red!7] (1.7,1.1) -- plot[variable=\t, domain=0:1.1, samples=30] ({1.7-2.2*(1.1-\t)*(1.1-\t)},{1.1-\t}) -- cycle;
+				\fill[red!7] (-1.7,-1.1) -- plot[variable=\t, domain=0:1.1, samples=30] ({-1.7+2.2*(1.1-\t)*(1.1-\t)},{-1.1+\t}) -- cycle;
+			\end{scope}
 			\draw[thick, rounded corners=6pt] (-1.7,-1.1) rectangle (1.7,1.1);
-			\node[font=\scriptsize, red!70!black, above right, inner sep=2pt] at (-1.7,-1.1) {$g(x,u)\le 0$};
+			\node[font=\scriptsize, red!70!black] at (-1.3,-0.74) {unsafe};
 			% the maximal safe set of (d), drawn dashed: the CBF set is an inner approximation of it
 			\draw[gray!60, dashed, thin] plot[variable=\t, domain=0:1.1, samples=30] ({1.7-2.2*(1.1-\t)*(1.1-\t)},{1.1-\t});
 			\draw[gray!60, dashed, thin] plot[variable=\t, domain=0:1.1, samples=30] ({-1.7+2.2*(1.1-\t)*(1.1-\t)},{-1.1+\t});
@@ -114,12 +119,18 @@
 	\begin{subfigure}[b]{0.32\textwidth}
 		\centering
 		\begin{tikzpicture}[scale=1.25, >=stealth]
+			% the unsafe states of (d), shaded as in (d)
+			\begin{scope}
+				\clip[rounded corners=6pt] (-1.7,-1.1) rectangle (1.7,1.1);
+				\fill[red!7] (1.7,1.1) -- plot[variable=\t, domain=0:1.1, samples=30] ({1.7-2.2*(1.1-\t)*(1.1-\t)},{1.1-\t}) -- cycle;
+				\fill[red!7] (-1.7,-1.1) -- plot[variable=\t, domain=0:1.1, samples=30] ({-1.7+2.2*(1.1-\t)*(1.1-\t)},{-1.1+\t}) -- cycle;
+			\end{scope}
 			\draw[thick, rounded corners=6pt] (-1.7,-1.1) rectangle (1.7,1.1);
-			\node[font=\scriptsize, red!70!black, above right, inner sep=2pt] at (-1.7,-1.1) {$g(x,u)\le 0$};
+			\node[font=\scriptsize, red!70!black] at (-1.3,-0.74) {unsafe};
 			% the safe set is never computed: the maximal safe set of (d), drawn dashed
 			\draw[gray!60, dashed, thin] plot[variable=\t, domain=0:1.1, samples=30] ({1.7-2.2*(1.1-\t)*(1.1-\t)},{1.1-\t});
 			\draw[gray!60, dashed, thin] plot[variable=\t, domain=0:1.1, samples=30] ({-1.7+2.2*(1.1-\t)*(1.1-\t)},{-1.1+\t});
-			\node[font=\scriptsize, gray] at (-1.0,-0.38) {implicit};
+			\node[font=\scriptsize, gray] at (0.15,-0.68) {implicit};
 			\fill[blue!25] (-0.15,-0.15) ellipse (0.3 and 0.18);
 			\draw[blue!70!black, thin] (-0.15,-0.15) ellipse (0.3 and 0.18);
 			\node[font=\scriptsize, blue!70!black, left, inner sep=2pt] at (-0.45,-0.15) {$\mathcal S_f$};
