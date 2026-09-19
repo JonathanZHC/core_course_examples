@@ -4,8 +4,8 @@ Each case re-runs the Chapter 6.3 experiment (tuned GP on the data with a gap, G
 beta = 0, 1, 2, 3 plus the true-model reference) for its own cost weights and covariance
 propagation, caches the closed-loop results, and draws the two-row figure:
 
-    Problem Setup (true-scale scene + zoomed terrain/GP strip)
-    Plan at t = 0 in the state space  |  Cost vs. Safety
+    Problem setup (true-scale scene + zoomed terrain/GP strip)
+    Plan at t = 0 in the state space  |  Cost vs. safety
 
 Usage, from the repository root with the course Python environment (acados required):
 
@@ -258,7 +258,7 @@ def panel_scene(ax, D):
     ax.set_yticks([0, 0.2])
     ax.set_ylabel("height $h$")
     ax.tick_params(axis="x", labelbottom=False)
-    ax.set_title("Problem Setup", pad=3)
+    ax.set_title("Problem setup", pad=3)
 
 
 def panel_profile(ax, D, color=C_MAIN, label=r"learned $\hat h(p)\pm2\sigma_h$", guides=True, extra_points=False, xlabel=True):
@@ -380,7 +380,7 @@ def panel_tradeoff(ax, D, cfg, D_extra=None):
     ax.yaxis.set_major_locator(MaxNLocator(4, integer=True))
     ax.set_xlabel("constraint violation\n" + r"steps with $|v_k| > v_{\max}$ [%]", labelpad=1)
     ax.set_ylabel("closed-loop cost\n" + cost_formula(cfg), fontsize=6, labelpad=3)
-    ax.set_title("Cost vs. Safety", pad=3)
+    ax.set_title("Cost vs. safety", pad=3)
     ax.grid(True, linewidth=0.4, alpha=0.5)
 
 
