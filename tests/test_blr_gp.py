@@ -159,7 +159,7 @@ class MPCIntegrationTests(unittest.TestCase):
     def test_stage_zero_reference_and_solver_failure(self):
         ctrl = GPMPCController.__new__(GPMPCController)
         ctrl.N=2;ctrl.dim_states=2;ctrl.dim_inputs=1;ctrl.dt=.1;ctrl.beta=0
-        ctrl.name='test';ctrl.n_saturated=0;ctrl.Sigma_x_log=[]
+        ctrl.name='test';ctrl.n_empty=0;ctrl.Sigma_x_log=[]
         ctrl.env=Mock(target_state=np.array([.5,0.]),state_lbs=np.array([-2.,-.6]),state_ubs=np.array([2.,.6]))
         ctrl.dynamics=Mock();ctrl.dynamics.one_step_forward.return_value=np.zeros(2)
         ctrl.propagate_uncertainty=Mock(return_value=[np.zeros((2,2))]*3)
@@ -167,6 +167,22 @@ class MPCIntegrationTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError,'status 2'): ctrl.compute_action(np.zeros(2),0)
         refs=[call.args[2] for call in ctrl.solver.set.call_args_list if call.args[:2]==(0,'yref')]
         assert_allclose(refs[0],[.5,0.,0.])
+
+    def test_uncapped_tightening_preserves_margins_and_counts_empty_boxes(self):
+        ctrl = GPMPCController.__new__(GPMPCController)
+        ctrl.beta = 2.0
+        ctrl.n_empty = 0
+        ctrl.env = Mock(state_lbs=np.array([-2., -.6]), state_ubs=np.array([2., .6]))
+        # A 0.55 speed margin exceeds the former 0.48 cap, but leaves a nonempty box.
+        lb, ub = ctrl.tighten_state_constraints(np.diag([0., .275**2]))
+        assert_allclose(lb, [-2., -.05], atol=1e-14)
+        assert_allclose(ub, [2., .05], atol=1e-14)
+        self.assertEqual(ctrl.n_empty, 0)
+        # Both coordinates cross; count this as one empty stage box, preserving bounds.
+        lb, ub = ctrl.tighten_state_constraints(np.diag([1.1**2, .35**2]))
+        assert_allclose(lb, [.2, .1], atol=1e-14)
+        assert_allclose(ub, [-.2, -.1], atol=1e-14)
+        self.assertEqual(ctrl.n_empty, 1)
 
 
 if __name__=='__main__': unittest.main()
