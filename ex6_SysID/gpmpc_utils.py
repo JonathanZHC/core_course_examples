@@ -19,7 +19,7 @@ class GPMPCController(LQRController):
       3. tightens the state constraints by beta standard deviations,
              lb + beta*sqrt(diag(Sigma_i))  <=  x_i  <=  ub - beta*sqrt(diag(Sigma_i)),
          an approximate marginal Gaussian tightening (beta = 2 gives 95.45% for
-         a scalar two-sided interval before capping or softening). This is not a
+         a scalar two-sided interval before softening). This is not a
          joint trajectory guarantee: temporal model-error correlation is ignored
          and the ancillary gain is used only in the covariance approximation.
 
@@ -38,7 +38,7 @@ class GPMPCController(LQRController):
         self.dynamics.build_stochastic_model(self.dt)
         self.Sigma_w = Sigma_w if Sigma_w is not None else np.zeros((self.dim_states, self.dim_states))
         self.Sigma_x_log = []
-        self.n_saturated = 0
+        self.n_empty = 0
         self.K_ancillary = self._ancillary_gain()
 
     def setup(self):
@@ -122,18 +122,19 @@ class GPMPCController(LQRController):
             Sigma_seq.append(A_cl @ Sigma_seq[i] @ A_cl.T + Sigma_w_i + self.Sigma_w)
         return Sigma_seq
 
-    # The tightened box is never allowed to shrink below this fraction of the original
-    # width. Saturating means the requested confidence level demands more margin than
-    # the constraint set contains, which is a modelling outcome worth knowing about,
-    # so occurrences are counted rather than silently clipped.
-    MIN_WIDTH_FRACTION = 0.2
-
     def tighten_state_constraints(self, Sigma_x):
+        '''
+        lb + beta*sigma <= x <= ub - beta*sigma with sigma = sqrt(diag(Sigma_x)).
+
+        The margin is not capped. If beta*sigma exceeds the half-width of the box, the
+        tightened bounds cross and the stage box is empty; the soft constraints then keep
+        the OCP feasible and the plan pays slack penalties. Such stage evaluations are
+        counted in n_empty, since they mean the requested confidence level demands more
+        margin than the constraint set contains, which is worth knowing about.
+        '''
         half_width = 0.5 * (self.env.state_ubs - self.env.state_lbs)
         margin = self.beta * np.sqrt(np.maximum(np.diag(Sigma_x), 0.0))
-        max_margin = (1.0 - self.MIN_WIDTH_FRACTION) * half_width
-        self.n_saturated += int(np.any(margin > max_margin))
-        margin = np.minimum(margin, max_margin)
+        self.n_empty += int(np.any(margin > half_width))
         return self.env.state_lbs + margin, self.env.state_ubs - margin
 
     def compute_action(self, current_state, current_time):

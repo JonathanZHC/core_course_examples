@@ -138,7 +138,7 @@ def simulate_case(name):
         states, inputs = np.array(sim.state_traj), np.array(sim.input_traj)
         return dict(states=states, inputs=inputs, sigma=np.array(ctrl.Sigma_x_log), pred=np.array(sim.state_pred_traj),
                     Sigma_full_k0=ctrl.Sigma_full_k0, cost=closed_loop_cost(states, inputs),
-                    violation=max(0.0, np.abs(states[:, 1]).max() - V_MAX), nsat=ctrl.n_saturated,
+                    violation=max(0.0, np.abs(states[:, 1]).max() - V_MAX), nempty=ctrl.n_empty,
                     nmaxiter=getattr(ctrl, "n_maxiter", 0))
 
     p_sym = ca.MX.sym("p")
@@ -152,12 +152,12 @@ def simulate_case(name):
         results[f"b{b}"] = run(env_l, float(b), f"GPMPC_{name}_beta{b}")
         r = results[f"b{b}"]
         print(f"[{name}] beta={b}: violation {r['violation']:.4f}  cost {r['cost']:.1f}  "
-              f"final |p - p_goal| {abs(r['states'][-1, 0] - XT[0]):.4f}  cap saturations {r['nsat']}  max-iter steps {r['nmaxiter']}")
+              f"final |p - p_goal| {abs(r['states'][-1, 0] - XT[0]):.4f}  empty stage boxes {r['nempty']}  max-iter steps {r['nmaxiter']}")
 
     save = dict(p_train=p_train.ravel(), h_train=h_train.ravel(), p_grid=p_grid, h_true=h_true, gp_mean=gp_mean, gp_std=gp_std,
                 v_max=V_MAX, dt=1 / FREQ, N=N, gap=np.array(GAP), target=XT[0], l_opt=l_opt, sf_opt=sf_opt)
     for k, r in results.items():
-        for f in ("states", "inputs", "sigma", "pred", "Sigma_full_k0", "cost", "violation", "nsat", "nmaxiter"):
+        for f in ("states", "inputs", "sigma", "pred", "Sigma_full_k0", "cost", "violation", "nempty", "nmaxiter"):
             save[f"{k}_{f}"] = r[f]
     os.makedirs(DATA_DIR, exist_ok=True)
     np.savez(os.path.join(DATA_DIR, f"{name}.npz"), **save)
@@ -184,7 +184,6 @@ PAPER_RC = {"font.size": 7, "axes.titlesize": 7, "axes.labelsize": 7, "xtick.lab
             "mathtext.fontset": "dejavuserif", "pdf.fonttype": 42}
 RAMP = ["#f0a08c", "#dd6b52", "#c0392b", "#7b241c"]      # beta = 0, 1, 2, 3
 C_MAIN, C_TIGHT = RAMP[2], "tab:blue"
-CAP = 0.8 * V_MAX                                        # MIN_WIDTH_FRACTION = 0.2 in GPMPCController
 CAR_L, CAR_R = 0.2, 0.035                                # the car of utils/simulator.py, in data units
 CAR_AXLE = 1.5 * CAR_R
 CAR_COLOR = "steelblue"
@@ -315,7 +314,7 @@ def panel_statespace(ax, D, D_overlay=None, beta=2):
     draw_plan_ellipses(ax, mu, S, beta, facecolor=C_MAIN, alpha=0.09, edgecolor="none", zorder=1)
     draw_plan_ellipses(ax, mu, S, beta, facecolor="none", edgecolor=C_MAIN, alpha=0.45, lw=0.4, zorder=2)
     ax.plot(mu[:, 0], mu[:, 1], "-o", color=C_MAIN, lw=1.2, ms=2.0, zorder=4, label=r"plan $\mu_{i|0}$")
-    ax.plot(mu[1:, 0], v_max - np.minimum(beta * sig_v[1:], CAP), color=C_TIGHT, ls="-.", lw=1.0, zorder=5, label="tightened limit")
+    ax.plot(mu[1:, 0], v_max - beta * sig_v[1:], color=C_TIGHT, ls="-.", lw=1.0, zorder=5, label="tightened limit")
     ax.plot(mu[0, 0], mu[0, 1], "o", color="k", ms=3.2, zorder=6)
     ax.annotate("start", (mu[0, 0], mu[0, 1]), xytext=(4, -9), textcoords="offset points", fontsize=5.5)
     handles, labels = ax.get_legend_handles_labels()
