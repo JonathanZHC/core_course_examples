@@ -24,6 +24,9 @@ These examples complement the theoretical concepts covered in the lectures by pr
 └── ... # More examples
 ```
 
+## Repository Structure
+This is a table introducing the course content.
+
 ## Setup
 
 ### Docker Desktop
