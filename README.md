@@ -37,7 +37,7 @@ Each chapter folder contains one or more notebooks. The table lists the main met
 | | [5.2 Tracking and Robust MPC](ex5_MPC/5.2_model_predictive_control_part2.ipynb) | tracking MPC, robust MPC |
 | **6. Model Learning and Learning-based Control**<br>`ex6_SysID/` | [6.1 Model Learning](ex6_SysID/6.1_SysID.ipynb) | linear regression (LR), Bayesian linear regression (BLR) |
 | | [6.2 Learning-based MPC](ex6_SysID/6.2_Learning_Based_MPC.ipynb) | MPC with an LR model, robust MPC with a BLR model |
-| | [6.3 GP Learning and GP-MPC](ex6_SysID/6.3_GP_Learning_and_GP_MPC.ipynb) | Gaussian process (GP) regression, GP-MPC |
+| | [6.3 GP Learning and GP-MPC](ex6_SysID/6.3_GP_Learning_and_GP_MPC.ipynb) | Gaussian process (GP) regression, BLR vs. GP, GP-MPC |
 | | [6.4 Data-Enabled Predictive Control](ex6_SysID/6.4_Data_Enabled_Predictive_Control.ipynb) | Willems' fundamental lemma, DeePC, regularized DeePC for nonlinear systems |
 | **7. Reinforcement Learning**<br>`ex7_RL/` | [7.0 Stochastic Shortest Path](ex7_RL/7.0_ssp.ipynb) | stochastic shortest path (SSP) problem |
 | | [7.1 Model-based RL](ex7_RL/7.1_mbrl.ipynb) | value iteration, policy iteration |
